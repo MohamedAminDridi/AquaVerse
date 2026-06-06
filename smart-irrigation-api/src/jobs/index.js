@@ -54,10 +54,13 @@ exports.startJobs = () => {
     }
 
     // ── Nodes: offline if no last_seen in 30 s ────────────────────────
+    // Skip nodes in deep-sleep mode — they're silent between wakes by design,
+    // so marking them offline would spam false alerts.
     const nodeCutoff = new Date(now - 30 * 1000);
     const offlineNodes = await Node.find({
       last_seen: { $lt: nodeCutoff },
       status:    'online',
+      'sleep.enabled': { $ne: true },
     }).select('_id device_id farm');
 
     for (const node of offlineNodes) {
@@ -125,6 +128,46 @@ exports.startJobs = () => {
       try { await reconcileFarmPump(sch.farm); } catch (e) { logger.warn(`Schedule pump reconcile failed: ${e.message}`); }
       if (isStart) { sch.lastRun = now; await sch.save().catch(() => {}); }
       logger.info(`Schedule "${sch.name || sch._id}" ${isStart ? 'opened' : 'closed'} ${nodes.length} valve(s)`);
+    }
+  });
+
+  // ── Deep-sleep schedules: match each node's wake interval to its active 24h
+  // band, plus the legacy daily night window. Uses deliverToNode so a command
+  // for a sleeping node is queued and lands on its next wake. ──────────────────
+  cron.schedule('* * * * *', async () => {
+    const irr  = require('../controllers/irrigation.controller');
+    const now  = new Date();
+    const mins = now.getHours() * 60 + now.getMinutes();         // server local time
+
+    // Band schedules: always duty-cycling; awake/sleep durations vary by time.
+    const banded = await Node.find({ 'sleep.enabled': true, 'sleep.bands.0': { $exists: true } });
+    for (const node of banded) {
+      const band = irr.currentBand(node.sleep.bands, mins);
+      if (band && (band.awakeMin !== node.sleep.awakeMin || band.sleepMin !== node.sleep.sleepMin)) {
+        irr.deliverToNode(node, { id: node.device_id, type: 'sleep_config', payload: { enabled: true, awake_min: band.awakeMin, sleep_min: band.sleepMin }, ts: Date.now() });
+        node.sleep.awakeMin = band.awakeMin; node.sleep.sleepMin = band.sleepMin; node.sleep.state = 'sleeping';
+        node.markModified('sleep'); await node.save().catch(() => {});
+        logger.info(`💤 ${node.device_id} band → awake ${band.awakeMin}m / sleep ${band.sleepMin}m`);
+      }
+    }
+
+    // Legacy daily night window (only for nodes without a band schedule).
+    const daily = await Node.find({ 'sleep.daily': true, 'sleep.bands.0': { $exists: false } });
+    for (const node of daily) {
+      const s = node.sleep || {};
+      const startMin = irr.hhmmToMin(s.startTime || '22:00');
+      const wakeMin  = irr.hhmmToMin(s.wakeTime  || '06:00');
+      if (mins === startMin && s.state !== 'sleeping') {
+        irr.deliverToNode(node, { id: node.device_id, type: 'sleep_now', payload: { awake_min: s.awakeMin || 1, sleep_min: s.sleepMin || 15 }, ts: Date.now() });
+        node.sleep.enabled = true; node.sleep.state = 'sleeping';
+        node.markModified('sleep'); await node.save().catch(() => {});
+        logger.info(`💤 ${node.device_id} daily sleep`);
+      } else if (mins === wakeMin && s.state !== 'awake') {
+        irr.deliverToNode(node, { id: node.device_id, type: 'wake', payload: {}, ts: Date.now() });
+        node.sleep.enabled = false; node.sleep.state = 'awake';
+        node.markModified('sleep'); await node.save().catch(() => {});
+        logger.info(`☀️ ${node.device_id} daily wake`);
+      }
     }
   });
 

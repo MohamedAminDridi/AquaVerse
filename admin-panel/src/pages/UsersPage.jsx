@@ -73,7 +73,7 @@ export default function UsersPage() {
         </div>
       )}
 
-      {/* Add client form */}
+      {/* Add client formm */}
       {showAdd && (
         <div className="bg-white border border-gray-200 rounded-xl p-6">
           <h2 className="text-sm font-semibold text-gray-800 mb-4">New client</h2>

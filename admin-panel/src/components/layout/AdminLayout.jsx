@@ -1,5 +1,5 @@
 import { Outlet }       from 'react-router-dom';
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { io }           from 'socket.io-client';
 import Sidebar          from './Sidebar';
 import TopBar           from './TopBar';
@@ -47,6 +47,17 @@ export default function AdminLayout() {
           addToast, toasts, removeToast }           = useAlertStore();
   const socketRef = useRef(null);
 
+  // Collapsible nav sidebar (persists across reloads). Lets the 3D twin (and any
+  // wide page) use the full window width.
+  const [navOpen, setNavOpen] = useState(() => {
+    try { return localStorage.getItem('nav_collapsed') !== '1'; } catch { return true; }
+  });
+  const toggleNav = () => setNavOpen((open) => {
+    const next = !open;
+    try { localStorage.setItem('nav_collapsed', next ? '0' : '1'); } catch { /* ignore */ }
+    return next;
+  });
+
   useEffect(() => {
     if (!token) return;
 
@@ -84,9 +95,9 @@ export default function AdminLayout() {
 
   return (
     <div className="flex h-screen overflow-hidden bg-gray-50">
-      <Sidebar />
+      {navOpen && <Sidebar />}
       <div className="flex flex-col flex-1 overflow-hidden">
-        <TopBar />
+        <TopBar navOpen={navOpen} onToggleNav={toggleNav} />
         <main className="flex-1 overflow-y-auto p-6">
           <Outlet />
         </main>

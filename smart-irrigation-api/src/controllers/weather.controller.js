@@ -42,6 +42,16 @@ exports.getForecast = asyncHandler(async (req, res) => {
   success(res, { forecast: data.hourly });
 });
 
+// Daily forecast — today + next 3 days — for the 3D "Future Reality" overlay.
+exports.getDaily = asyncHandler(async (req, res) => {
+  const farm = await getFarm(req.params.farmId);
+  if (farm.location?.lat == null || farm.location?.lng == null) {
+    return success(res, { daily: [], message: 'Farm has no coordinates' });
+  }
+  const daily = await weatherService.getDaily(farm.location.lat, farm.location.lng, 4);
+  success(res, { daily });
+});
+
 exports.getHistory = asyncHandler(async (req, res) => {
   success(res, { history: [], message: 'Historical weather stored per-farm after station registration' });
 });

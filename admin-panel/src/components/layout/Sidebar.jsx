@@ -2,13 +2,14 @@ import { NavLink }       from 'react-router-dom';
 import { useAlertStore } from '../../store/alertStore';
 
 const links = [
+  { to: '/twin',       label: '3D Twin',      icon: '🌐'  },
   { to: '/dashboard',  label: 'Dashboard',    icon: '▦'  },
   { to: '/farms',      label: 'Farms',        icon: '🗺'  },
   { to: '/gateways',   label: 'Gateways',     icon: '📡'  },
   { to: '/nodes',      label: 'Nodes',        icon: '🔌'  },
   { to: '/alerts',     label: 'Alerts',       icon: '🔔', badge: true },
   { to: '/analytics',  label: 'Analytics',    icon: '📊'  },
-  { to: '/twin',       label: '3D Twin',      icon: '🌐'  },
+  
   { to: '/users',      label: 'Users',        icon: '👥'  },
   { to: '/ota',        label: 'OTA Updates',  icon: '☁'  },
   { to: '/settings',   label: 'Settings',     icon: '⚙'  },

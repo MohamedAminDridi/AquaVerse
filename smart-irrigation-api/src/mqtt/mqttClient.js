@@ -173,6 +173,7 @@ async function handleGatewayHeartbeat(farmId, deviceId, payload) {
 const publish = (topic, payload, opts = { qos: 1 }) => {
   if (!client?.connected) { logger.warn(`MQTT not connected — dropped: ${topic}`); return false; }
   client.publish(topic, JSON.stringify(payload), opts);
+  logger.info(`📤 MQTT publish → ${topic}`);   // so we can verify command topics match the gateway's subscription
   return true;
 };
 

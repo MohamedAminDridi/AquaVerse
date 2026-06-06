@@ -2,7 +2,7 @@ import { useAuthStore }  from '../../store/authStore';
 import { useAlertStore }  from '../../store/alertStore';
 import { useNavigate, Link } from 'react-router-dom';
 
-export default function TopBar() {
+export default function TopBar({ navOpen = true, onToggleNav }) {
   const { user, logout } = useAuthStore();
   const unreadCount      = useAlertStore(s => s.unreadCount);
   const nav = useNavigate();
@@ -11,7 +11,15 @@ export default function TopBar() {
 
   return (
     <header className="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between">
-      <div />
+      <button
+        onClick={onToggleNav}
+        title={navOpen ? 'Hide menu' : 'Show menu'}
+        aria-label={navOpen ? 'Hide menu' : 'Show menu'}
+        className="text-gray-500 hover:text-gray-800 hover:bg-gray-100 transition-colors
+                   w-9 h-9 -ml-1.5 grid place-items-center rounded-lg text-xl leading-none"
+      >
+        {navOpen ? '⮜' : '☰'}
+      </button>
       <div className="flex items-center gap-4">
 
         {/* Bell icon with unread badge */}

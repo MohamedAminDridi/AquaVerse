@@ -9,7 +9,7 @@ const nodeSchema = new mongoose.Schema({
   // Saved 3D-twin layout + plot customization. x/z = ground position (metres);
   // size = plot side length; rot = degrees; color = custom tint (null=status); label = crop name;
   // crop = plant species rendered on the plot (tomato/lettuce/wheat/…).
-  twin:                { x: Number, z: Number, size: Number, rot: Number, color: String, label: String, crop: String },
+  twin:                { x: Number, z: Number, size: Number, rot: Number, color: String, label: String, crop: String, pipes: String },
   // Irrigation zone name (groups plots that share a schedule / can be toggled together).
   zone:                { type: String, default: null, trim: true },
   sensor_types:        [{ type: String }],
@@ -24,6 +24,24 @@ const nodeSchema = new mongoose.Schema({
   valve_state:         { type: String, enum: ['open','closed','unknown'], default: 'unknown' },
   valve_pct:           { type: Number, default: 0, min: 0, max: 100 },  // servo position 0–100% (100% = 90°)
   pump_state:          { type: String, enum: ['on','off','unknown'], default: 'unknown' },
+  // Deep-sleep duty cycle. enabled = sleep mode active now; intervalMin = wake
+  // every N minutes to report+listen; daily = recurring nightly window between
+  // startTime and wakeTime (server local HH:MM); state = last commanded state.
+  sleep: {
+    enabled:     { type: Boolean, default: false },
+    // Duty cycle: stay awake awakeMin, then deep-sleep sleepMin, repeat
+    // (e.g. awake 5 min, sleep 60 min). Restarting the node disables sleep.
+    awakeMin:    { type: Number, default: 1,  min: 0.05, max: 1440 },
+    sleepMin:    { type: Number, default: 15, min: 0.2,  max: 1440 },
+    // Optional 24h band schedule: each band's awake/sleep applies from its start
+    // until the next band's start (wrapping midnight). The backend keeps the node
+    // matched to the active band (the node has no RTC to do it itself).
+    bands:       [{ start: { type: String }, awakeMin: { type: Number }, sleepMin: { type: Number } }],
+    daily:       { type: Boolean, default: false },   // legacy single night window
+    startTime:   { type: String, default: '22:00' },
+    wakeTime:    { type: String, default: '06:00' },
+    state:       { type: String, enum: ['awake','sleeping'], default: 'awake' },
+  },
 }, { timestamps: true });
 
 module.exports = mongoose.model('Node', nodeSchema);

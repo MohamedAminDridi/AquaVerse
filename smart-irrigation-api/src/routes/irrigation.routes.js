@@ -11,4 +11,10 @@ router.post('/nodes/:nodeId/pump/stop',         ctrl.stopPump);
 router.get ('/nodes/:nodeId/commands',          ctrl.getCommands);
 router.get ('/nodes/:nodeId/commands/:cmdId',   ctrl.getCommandStatus);
 
+// Deep-sleep duty cycle
+router.get ('/nodes/:nodeId/sleep',             ctrl.getSleep);
+router.put ('/nodes/:nodeId/sleep',             ctrl.setSleep);
+router.post('/nodes/:nodeId/sleep/now',         ctrl.sleepNow);
+router.post('/nodes/:nodeId/sleep/wake',        ctrl.wakeNode);
+
 module.exports = router;

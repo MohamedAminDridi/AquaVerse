@@ -3,6 +3,7 @@ const Node           = require('../models/Node.model');
 const Alert          = require('../models/Alert.model');
 const alertService   = require('../services/alert.service');
 const { emitToFarm } = require('../socket/socketServer');
+const pendingCommands = require('./pendingCommands');
 const logger         = require('../utils/logger');
 
 /**
@@ -19,23 +20,45 @@ module.exports = async function handleTelemetry(farmId, nodeDeviceId, payload) {
       return;
     }
 
-    // Map ESP32 short field names → meaningful names
-    const soil = payload.soil ?? null;
-    const temp = payload.temp ?? null;
-    const hum  = payload.hum  ?? null;
-    const bat  = payload.bat  ?? null;
-    const rssi = payload.lora_rssi ?? payload.rssi ?? null;
-    // INA219 battery monitor fields
-    const charging = payload.charging ?? null;   // bool: is the battery charging?
-    const batV     = payload.bat_v   ?? null;     // bus voltage (V)
-    const batMa    = payload.bat_ma  ?? null;     // current (mA, + discharge / − charge)
-    const batMah   = payload.bat_mah ?? null;     // coulomb-counted charge remaining (mAh)
-    const timeMin  = payload.time_min ?? null;    // minutes to full (charging) / empty (discharging)
+    // The node just reported → it's awake in its RX window right now. Flush any
+    // commands queued while it was asleep (valve, sleep_config, wake) so they
+    // land inside this listen window. Lazy require avoids a circular dep
+    // (mqttClient → telemetryHandler → mqttClient).
+    const { publish } = require('./mqttClient');
+    const flushed = pendingCommands.flush(node.device_id, publish);
+    if (flushed) logger.info(`📨 Delivered ${flushed} queued command(s) to ${nodeDeviceId} on wake`);
 
-    // Valve / pump state — node sends both short (valve/pump) and long (valve_state/pump_state) forms
-    const valveState = payload.valve_state ?? payload.valve ?? null;
-    const valvePct   = payload.valve_pct   ?? null;
-    const pumpState  = payload.pump_state  ?? payload.pump  ?? null;
+    // Compact ESP32 field names (LoRa-size-optimised) → meaningful names. The
+    // older long keys are still accepted so a not-yet-reflashed node keeps working.
+    //   s/t/h/b soil,temp,hum,battery%  ·  bv/bi/bm volts,mA,mAh  ·  tm min left
+    //   c charging(0/1)  ·  q seq  ·  vp valve%  ·  p pump(0/1)
+    const soil = payload.s ?? payload.soil ?? null;
+    const temp = payload.t ?? payload.temp ?? null;
+    const hum  = payload.h ?? payload.hum  ?? null;
+    const bat  = payload.b ?? payload.bat  ?? null;
+    const rssi = payload.lora_rssi ?? payload.rssi ?? null;
+    const seq  = payload.q ?? payload.seq ?? null;
+    // INA219 battery monitor fields
+    const charging = payload.c != null ? !!payload.c : (payload.charging ?? null);  // bool: charging?
+    const batV     = payload.bv ?? payload.bat_v   ?? null;   // bus voltage (V)
+    const batMa    = payload.bi ?? payload.bat_ma  ?? null;   // current (mA, + discharge / − charge)
+    const batMah   = payload.bm ?? payload.bat_mah ?? null;   // coulomb-counted charge remaining (mAh)
+    const timeMin  = payload.tm ?? payload.time_min ?? null;  // minutes to full (charging) / empty
+
+    // Valve / pump state. The compact packet sends only vp (valve %) and p (pump
+    // 0/1); the valve open/closed state is inferred from vp>0. Long forms accepted.
+    const valvePct   = payload.vp ?? payload.valve_pct ?? null;
+    let   valveState = payload.valve_state ?? payload.valve ?? null;
+    if (valveState == null && valvePct != null) valveState = valvePct > 0 ? 'open' : 'closed';
+    let   pumpState  = payload.pump_state ?? payload.pump ?? null;
+    if (pumpState == null && payload.p != null) pumpState = payload.p ? 'on' : 'off';
+
+    // Deep-sleep duty-cycle timing reported by the node (slp/awk/nap/up). The
+    // dashboard anchors its awake↔sleep countdown to these real device clocks.
+    const slpOn  = payload.slp != null ? !!payload.slp : null;  // sleep mode active?
+    const slpAwk = payload.awk ?? null;                          // awake window (s)
+    const slpNap = payload.nap ?? null;                          // sleep window (s)
+    const slpUp  = payload.up  ?? null;                          // s since this wake
 
     // Update node live state (including valve/pump so the DB is always accurate)
     await Node.findByIdAndUpdate(node._id, {
@@ -84,7 +107,12 @@ module.exports = async function handleTelemetry(farmId, nodeDeviceId, payload) {
       battery_mah:       batMah,
       battery_time_min:  timeMin,
       rssi,
-      seq: payload.seq ?? null,
+      seq,
+      // Sleep duty-cycle timing (omitted when the node isn't duty-cycling).
+      ...(slpOn  != null ? { slp_on:  slpOn  } : {}),
+      ...(slpAwk != null ? { slp_awk: slpAwk } : {}),
+      ...(slpNap != null ? { slp_nap: slpNap } : {}),
+      ...(slpUp  != null ? { slp_up:  slpUp  } : {}),
       ts:  new Date(),
     });
 

@@ -16,6 +16,50 @@ exports.getForecast = async (lat, lng, days = 1) => {
   return data;
 };
 
+// ── Daily forecast (today + next N days) for the "Future Reality" overlay ────
+// Includes sunshine_duration + shortwave_radiation_sum so the twin can predict
+// solar-panel charging quality per day, not just rain/temperature.
+const DAILY = [
+  'weather_code', 'temperature_2m_max', 'temperature_2m_min',
+  'precipitation_sum', 'precipitation_probability_max',
+  'wind_speed_10m_max', 'sunshine_duration', 'shortwave_radiation_sum',
+  'sunrise', 'sunset',
+];
+exports.getDaily = async (lat, lng, days = 4) => {
+  const { data } = await axios.get(BASE, {
+    params: {
+      latitude: lat, longitude: lng, forecast_days: days,
+      daily: DAILY.join(','), timezone: 'auto',
+    },
+    timeout: 8000,
+  });
+  const d = data.daily || {};
+  const out = [];
+  const n = (d.time || []).length;
+  for (let i = 0; i < n; i++) {
+    const sunSec = d.sunshine_duration?.[i];
+    const rad    = d.shortwave_radiation_sum?.[i];           // MJ/m²/day
+    // crude solar-yield score 0..1 (typical clear-sky day ≈ 22–28 MJ/m²)
+    const solarScore = rad != null ? Math.max(0, Math.min(1, rad / 26)) : null;
+    out.push({
+      date:        d.time[i],
+      weatherCode: d.weather_code?.[i],
+      condition:   codeToCondition(d.weather_code?.[i]),
+      tempMax:     d.temperature_2m_max?.[i],
+      tempMin:     d.temperature_2m_min?.[i],
+      precipSum:   d.precipitation_sum?.[i],
+      precipProb:  d.precipitation_probability_max?.[i],
+      windMax:     d.wind_speed_10m_max?.[i],
+      sunshineHours: sunSec != null ? +(sunSec / 3600).toFixed(1) : null,
+      radiation:   rad,
+      solarScore:  solarScore != null ? +solarScore.toFixed(2) : null,
+      sunrise:     d.sunrise?.[i] || null,
+      sunset:      d.sunset?.[i]  || null,
+    });
+  }
+  return out;
+};
+
 // ── WMO weather code → simple condition the 3D scene can switch onn ───────────
 function codeToCondition(code) {
   if (code == null) return 'clear';

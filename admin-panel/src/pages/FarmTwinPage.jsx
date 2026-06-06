@@ -207,6 +207,7 @@ const LAYER_KEYS = Object.keys(LAYER_THEME);
 const NEON_BLUE = '#38e0ff';
 const NEON_CYAN = '#22d3ee';
 const SOLAR_YEL = '#ffd54a';
+const SLEEP_COL = new THREE.Color('#6366f1');   // indigo wash for sleeping node plots
 
 // Radial-gradient sprite texture used to fake neon glow / bloom (built once).
 function makeGlowTexture() {
@@ -776,7 +777,8 @@ function NodeEnergy({ deviceId, half }) {
 
   useFrame((_, dt) => {
     const d = useTwinStore.getState().byId[deviceId] || {};
-    const prod = Math.max(0, ENV.sun);          // solar production 0..1 (by sun height)
+    // solar production 0..1 — sun height × clear-sky (cloud cover cuts the yield)
+    const prod = Math.max(0, ENV.sun) * (1 - (ENV.cloud || 0) * 0.85);
     const bat  = Math.max(0, Math.min(100, Number(d.bat ?? d.battery_pct ?? 0)));
     const load = (d.pump ?? d.pump_state) === 'on' || (d.valve ?? d.valve_state) === 'open';
     // prefer the real INA219 charging flag; fall back to the solar estimate
@@ -834,17 +836,140 @@ function NodeEnergy({ deviceId, half }) {
   );
 }
 
+/* ------------------------------------------------------- unified "All" HUD */
+// One floating card anchored above a node, shown ONLY in the 🌐 "All" layer.
+// It folds every per-layer reading (water/climate/energy/comms/sleep) plus live
+// valve control into a single HUD, so the layers no longer stack their separate
+// tags on top of each other. onValve(deviceId, open, pct) issues the command.
+function AllLayerHud({ deviceId, onValve }) {
+  const dev      = useTwinStore((s) => s.byId[deviceId]) || {};
+  const sleepCfg = useTwinStore((s) => s.sleepCfg[deviceId]);
+  const sleepSt  = sleepCycleState(sleepCfg, dev);
+  const [asking, setAsking] = useState(false);
+  const [pct, setPct]       = useState(100);
+  const [, setTick]         = useState(0);
+  // 1s ticker keeps the battery-time + sleep countdown live.
+  useEffect(() => { const t = setInterval(() => setTick((n) => n + 1), 1000); return () => clearInterval(t); }, []);
+
+  const status    = dev.status || 'unknown';
+  const online    = status === 'online';
+  const bat       = dev.bat ?? dev.battery_pct;
+  const charging  = dev.charging ?? dev.battery_charging;
+  const soil      = dev.soil ?? dev.soil_moisture_pct;
+  const temp      = dev.temp;
+  const hum       = dev.hum;
+  const rssi      = dev.rssi ?? dev.lora_rssi;
+  const valveOpen = (dev.valve ?? dev.valve_state) === 'open';
+  const valvePct  = dev.valve_pct;
+  const pumpOn    = (dev.pump ?? dev.pump_state) === 'on';
+  const batV      = dev.bat_v ?? dev.battery_v;
+  const timeTxt   = fmtMin(dev.time_min ?? dev.battery_time_min);
+  const sleeping  = sleepCfg?.state === 'sleeping' || sleepCfg?.enabled;
+  const canControl = online || sleeping;          // sleeping → backend queues the command
+  const v = (x, suf = '') => (x === null || x === undefined || x === '' ? '—' : `${x}${suf}`);
+  const stop = (e) => e.stopPropagation();         // keep clicks off the canvas / orbit controls
+
+  return (
+    <Html position={[0, 2.6, 0]} center distanceFactor={11} className="select-none" zIndexRange={[120, 0]}>
+      <div
+        onPointerDown={stop} onClick={stop} onWheel={stop}
+        className="w-[212px] rounded-xl bg-slate-900/90 backdrop-blur-md shadow-2xl ring-1 ring-white/10 overflow-hidden text-white"
+      >
+        {/* header */}
+        <div className="flex items-center gap-1.5 px-2.5 pt-2 pb-1.5 border-b border-white/10">
+          <span className={`w-2 h-2 rounded-full ${sleeping ? 'bg-indigo-400' : online ? 'bg-emerald-400' : 'bg-rose-400'}`} />
+          <span className="font-semibold text-[12px] leading-none truncate flex-1">{dev.name || deviceId}</span>
+          {sleeping  && <span className="text-[10px]" title="sleeping">💤</span>}
+          {valveOpen && <span className="text-[10px]" title="watering">🚿</span>}
+          {pumpOn    && <span className="text-[10px]" title="pump on">⚙</span>}
+        </div>
+
+        {/* every metric in one grid */}
+        <div className="grid grid-cols-2 gap-x-2 gap-y-1 px-2.5 py-2 text-[11px] font-mono leading-none">
+          <span className="text-sky-300">💧 {v(soil, '%')}</span>
+          <span className="text-orange-300">🌡 {temp != null ? Math.round(temp) : '—'}°</span>
+          <span className="text-cyan-300">💦 {v(hum, '%')}</span>
+          <span className={charging ? 'text-amber-300' : (bat != null && bat < 20 ? 'text-rose-300' : 'text-emerald-300')}>
+            {charging ? '⚡' : '🔋'} {v(bat, '%')}{batV != null ? ` ${batV}v` : ''}
+          </span>
+          <span className="text-slate-300" title="signal">📶 {rssi != null ? Math.round(rssi) : '—'}</span>
+          <span className={valveOpen ? 'text-sky-300' : 'text-slate-400'}>
+            {valveOpen ? `🟢 ${valvePct != null ? valvePct + '%' : 'open'}` : '⚪ closed'}
+          </span>
+        </div>
+
+        {/* battery runtime + sleep countdown */}
+        {(timeTxt || sleepSt) && (
+          <div className="px-2.5 pb-1.5 space-y-0.5 text-[10px] font-semibold">
+            {timeTxt && (
+              <div className={charging ? 'text-amber-300' : 'text-emerald-300'}>
+                {charging ? `⚡ ${timeTxt} to full` : `🔋 ${timeTxt} left`}
+              </div>
+            )}
+            {sleepSt && (
+              <div className="text-indigo-300">{sleepSt.sleeping ? '💤' : '☀'} {sleepSt.label}</div>
+            )}
+          </div>
+        )}
+
+        {/* valve control */}
+        <div className="px-2.5 pb-2.5">
+          {!canControl ? (
+            <div className="text-center text-[10px] text-slate-400 bg-white/5 rounded-lg py-1.5">🚫 {status} — control unavailable</div>
+          ) : valveOpen ? (
+            <button onClick={() => onValve(deviceId, false)}
+              className="w-full text-[12px] font-semibold py-1.5 rounded-lg bg-slate-600 hover:bg-slate-500 active:scale-[.98] transition-all">
+              ■ Close valve
+            </button>
+          ) : asking ? (
+            <div className="rounded-lg bg-white/5 p-2 animate-[fadeIn_.15s_ease-out]">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-[10px] font-semibold text-sky-300">Open {pct}% · {Math.round(pct / 100 * 90)}°</span>
+                <button onClick={() => setAsking(false)} className="text-slate-400 hover:text-white text-sm leading-none">×</button>
+              </div>
+              <input type="range" min={0} max={100} step={5} value={pct}
+                onChange={(e) => setPct(parseInt(e.target.value, 10))} className="w-full accent-sky-400 mb-1.5" />
+              <div className="flex gap-1 mb-1.5">
+                {[25, 50, 75, 100].map((p) => (
+                  <button key={p} onClick={() => setPct(p)}
+                    className={`flex-1 text-[10px] font-semibold py-0.5 rounded ${pct === p ? 'bg-sky-500 text-white' : 'bg-white/10 text-slate-300 hover:bg-white/20'}`}>{p}</button>
+                ))}
+              </div>
+              <button onClick={() => { onValve(deviceId, true, pct); setAsking(false); }} disabled={pct === 0}
+                className="w-full text-[12px] font-semibold py-1.5 rounded-lg bg-sky-500 hover:bg-sky-400 disabled:opacity-40 active:scale-[.98] transition-all">
+                💧 Open {pct}%
+              </button>
+            </div>
+          ) : (
+            <button onClick={() => { setPct(100); setAsking(true); }}
+              className="w-full text-[12px] font-semibold py-1.5 rounded-lg bg-sky-500 hover:bg-sky-400 active:scale-[.98] transition-all">
+              💧 Open valve
+            </button>
+          )}
+        </div>
+      </div>
+    </Html>
+  );
+}
+
 /* -------------------------------------------------------------- node marker */
 // Each node is a big square field plot ("terrain"). Plot colour = status (or a
 // custom tint); a status-coloured border always shows online/offline at a
 // glance. Furrow stripes give it a tilled-field look. When a valve/pump is live
 // it sprays water; when something's wrong a red halo pulses underneath.
-function NodeMarker({ deviceId, gwColor, selected, editMode, onSelect, onBeginDrag }) {
+function NodeMarker({ deviceId, gwColor, selected, editMode, onSelect, onBeginDrag, onValve }) {
   const dev  = useTwinStore((s) => s.byId[deviceId]) || {};
   const pos  = useTwinStore((s) => s.positions[deviceId]) || [0, 0, 0];
   const cust = useTwinStore((s) => s.custom[deviceId]) || {};
   const feat = useTwinStore((s) => s.features);
   const energyLayer = useTwinStore((s) => s.digital && s.digitalLayer === 'energy');
+  // layers that show their own per-node tag → hide the default name/soil/battery label
+  const tagLayer = useTwinStore((s) => s.digital && (s.digitalLayer === 'energy' || s.digitalLayer === 'sleep'));
+  // The "All" (🌐) layer: one unified floating HUD per node replaces every other
+  // per-node tag/label (which would otherwise stack on top of each other).
+  const allLayer = useTwinStore((s) => s.digital && s.digitalLayer === 'all');
+  const sleepCfg = useTwinStore((s) => s.sleepCfg[deviceId]);
+  const sleepSt = sleepCycleState(sleepCfg, dev);   // null when not in sleep mode
   const plotRef  = useRef();
   const discRef  = useRef();
   const ringRef  = useRef();
@@ -852,7 +977,15 @@ function NodeMarker({ deviceId, gwColor, selected, editMode, onSelect, onBeginDr
   const ledRef   = useRef();
   const alertRef = useRef();
   const sprayRef = useRef();
+  const zzzRef   = useRef();
   const [hovered, setHovered] = useState(false);
+  // 1s re-render so the awake↔sleep countdown ticks (only while in sleep mode)
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (!sleepSt) return;
+    const t = setInterval(() => setTick((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, [!!sleepSt]);
   const target = useMemo(() => new THREE.Color(), []);
 
   const size = clampSize(cust.size ?? DEFAULT_SIZE);
@@ -890,17 +1023,23 @@ function NodeMarker({ deviceId, gwColor, selected, editMode, onSelect, onBeginDr
     const d = S.byId[deviceId] || dev;
     const now = performance.now();
     const status    = d.status;
-    const valveOpen = (d.valve ?? d.valve_state) === 'open';
-    const pumpOn    = (d.pump ?? d.pump_state) === 'on';
-    const watering  = valveOpen || pumpOn;   // valve open auto-starts the pump
+    const online    = status === 'online';
+    const valveOpen = online && (d.valve ?? d.valve_state) === 'open';
+    const pumpOn    = online && (d.pump ?? d.pump_state) === 'on';
+    const watering  = valveOpen || pumpOn;   // only an online node sprays / flows
+
+    // sleeping nodes (deep-sleep duty cycle) tint the plot indigo
+    const scfg = S.sleepCfg[deviceId];
+    const napping = !!(scfg && (scfg.enabled || scfg.state === 'sleeping'));
 
     // self-illuminate plots + soil disc at night so they don't go dark
     const nightLit = ENV.night * 0.6;
     if (plotRef.current) {
       plotTarget(target, status, customColor);
+      if (napping) target.lerp(SLEEP_COL, 0.55);   // wash the plot toward sleep-indigo
       const m = plotRef.current.material;
       m.color.lerp(target, Math.min(1, dt * 4));
-      m.emissive.copy(m.color); m.emissiveIntensity = nightLit;
+      m.emissive.copy(m.color); m.emissiveIntensity = nightLit + (napping ? 0.15 : 0);
     }
     if (discRef.current) {
       soilTarget(target, d.soil ?? d.soil_moisture_pct, status);
@@ -1054,21 +1193,52 @@ function NodeMarker({ deviceId, gwColor, selected, editMode, onSelect, onBeginDr
       {/* off-grid solar power: panel + battery + animated energy flows */}
       {feat.energy && <NodeEnergy deviceId={deviceId} half={half} />}
 
-      {feat.labels && !energyLayer && (() => {
+      {feat.labels && !tagLayer && !allLayer && (() => {
+        // Rich "reality" label — one glance summarises every layer: status +
+        // sleep/valve badges, then soil (water/biology), temp (climate),
+        // battery+charge (energy), and RSSI (comms).
         const bat = dev.bat ?? dev.battery_pct;
         const charging = dev.charging ?? dev.battery_charging;
+        const soil = dev.soil ?? dev.soil_moisture_pct;
+        const temp = dev.temp;
+        const rssi = dev.rssi ?? dev.lora_rssi;
+        const valveOpen = (dev.valve ?? dev.valve_state) === 'open';
+        const sleepingNode = sleepCfg?.state === 'sleeping' || sleepCfg?.enabled;
+        const online = dev.status === 'online';
         return (
-          <Html position={[0, 2.1, 0]} center distanceFactor={13} className="pointer-events-none select-none">
-            <div className="px-2 py-0.5 rounded-md bg-white/90 shadow text-[11px] leading-tight whitespace-nowrap border border-gray-200">
-              <span className="font-semibold text-gray-800">{label || dev.name || deviceId}</span>
-              <span className="text-gray-500"> · 💧{dev.soil ?? dev.soil_moisture_pct ?? '—'}%</span>
-              <span className={charging ? 'text-amber-500 font-semibold' : 'text-emerald-600 font-medium'}>
-                {' · '}{charging ? '⚡' : '🔋'}{bat ?? '—'}%{charging ? ' charging' : ''}
-              </span>
+          <Html position={[0, 2.2, 0]} center distanceFactor={13} className="pointer-events-none select-none">
+            <div className="rounded-lg bg-white/92 backdrop-blur-sm shadow-lg border border-gray-200/80 overflow-hidden whitespace-nowrap">
+              <div className="flex items-center gap-1.5 px-2 pt-1 pb-0.5">
+                <span className={`w-1.5 h-1.5 rounded-full ${sleepingNode ? 'bg-indigo-400' : online ? 'bg-emerald-500' : 'bg-rose-500'}`} />
+                <span className="font-semibold text-gray-800 text-[11px] leading-none truncate max-w-[120px]">{label || dev.name || deviceId}</span>
+                {sleepingNode && <span className="text-[9px]" title="sleeping">💤</span>}
+                {valveOpen && <span className="text-[9px]" title="watering">🚿</span>}
+              </div>
+              <div className="flex items-center gap-2 px-2 pb-1 text-[10px] font-mono leading-none">
+                <span className="text-sky-600">💧{soil ?? '—'}%</span>
+                <span className="text-orange-500">🌡{temp != null ? Math.round(temp) : '—'}°</span>
+                <span className={charging ? 'text-amber-500 font-semibold' : (bat != null && bat < 20 ? 'text-rose-500' : 'text-emerald-600')}>{charging ? '⚡' : '🔋'}{bat ?? '—'}%</span>
+                <span className="text-slate-400" title="signal">📶{rssi != null ? Math.round(rssi) : '—'}</span>
+              </div>
+              {sleepSt && (
+                <div className="px-2 pb-1 text-[9px] font-semibold text-indigo-600 border-t border-indigo-100/70 pt-0.5">
+                  {sleepSt.sleeping ? '💤' : '☀'} {sleepSt.label}
+                </div>
+              )}
             </div>
           </Html>
         );
       })()}
+
+      {/* bouncing 💤 over a sleeping node (reality view) */}
+      {!tagLayer && !allLayer && sleepSt?.sleeping && (
+        <Html position={[0, 2.85, 0]} center distanceFactor={12} className="pointer-events-none select-none">
+          <div className="text-xl animate-bounce" style={{ filter: 'drop-shadow(0 2px 3px rgba(79,70,229,0.5))' }}>💤</div>
+        </Html>
+      )}
+
+      {/* "All" layer — single unified floating HUD with every metric + valve control */}
+      {allLayer && <AllLayerHud deviceId={deviceId} onValve={onValve} />}
     </group>
   );
 }
@@ -1394,8 +1564,99 @@ function CinematicDirector({ controlsRef, scene, cinematic, editMode }) {
 // One buried pipe segment between two points. A transparent casing (cylinder)
 // plus a dashed blue centre-line whose dashes scroll to fake water flow. Flow
 // only animates while the segment's cluster is irrigating (pump on / valve open).
+// ── irrigation "shining water" palette + per-node internal pipe layouts ──
+const WATER_GLOW = '#3bf0ff';   // vivid cyan — water core when flowing
+const WATER_DEEP = '#0bb4e6';   // deeper blue — idle pipe
+const PIPE_LAYOUTS = ['comb', 'grid', 'loop', 'spiral'];
+const PIPE_ICON = { comb: '⊟', grid: '▦', loop: '▢', spiral: '🌀' };
+
+// Build an internal pipeline layout that fits inside a plot of half-extent h,
+// centred on the node's local origin (the inlet where the branch arrives).
+// Returns an array of polylines (each = [[x,y,z], …]).
+function buildNodePipes(layout, h, y) {
+  const m = h * 0.82;                       // stay inside the plot border
+  const lines = [];
+  if (layout === 'grid') {
+    const n = 3;
+    for (let i = 0; i < n; i++) {
+      const o = -m + (2 * m) * (i / (n - 1));
+      lines.push([[-m, y, o], [m, y, o]]);
+      lines.push([[o, y, -m], [o, y, m]]);
+    }
+    lines.push([[0, y, 0], [0, y, -m]]);    // inlet feed
+  } else if (layout === 'loop') {
+    lines.push([[-m, y, -m], [m, y, -m], [m, y, m], [-m, y, m], [-m, y, -m]]);  // border loop
+    lines.push([[0, y, -m], [0, y, m]]);    // cross feeders
+    lines.push([[-m, y, 0], [m, y, 0]]);
+  } else if (layout === 'spiral') {
+    const pts = [[0, y, 0]];
+    let l = -m, r = m, t = -m, b = m; const step = m * 0.34;
+    for (let k = 0; k < 3 && r - l > step; k++) {
+      pts.push([l, y, t], [r, y, t], [r, y, b], [l, y, b], [l, y, t]);
+      l += step; r -= step; t += step; b -= step;
+    }
+    lines.push(pts);
+  } else {                                  // 'comb' — drip manifold (default)
+    const n = 4;
+    lines.push([[0, y, -m], [0, y, m]]);    // spine
+    for (let i = 0; i < n; i++) {
+      const o = (-m + (2 * m) * (i / (n - 1))) * 0.92;
+      lines.push([[0, y, o], [m, y, o]]);   // laterals
+      lines.push([[0, y, o], [-m, y, o]]);
+    }
+  }
+  return lines;
+}
+
+// LAYER · WATER — the pipelines INSIDE a node's plot. Each is drawn as a bright
+// neon core + a soft halo so it glows; when the node's valve/pump opens the
+// water flows (dash scroll) and lights up vividly. Architecture is per-node
+// (custom.pipeLayout): comb / grid / loop / spiral.
+function NodeIrrigation({ deviceId }) {
+  const pos  = useTwinStore((s) => s.positions[deviceId]);
+  const cust = useTwinStore((s) => s.custom[deviceId]) || {};
+  const refs = useRef([]);
+  const half   = clampSize(cust.size ?? DEFAULT_SIZE) / 2;
+  const layout = PIPE_LAYOUTS.includes(cust.pipeLayout) ? cust.pipeLayout : 'comb';
+  const rot    = ((cust.rot ?? 0) * Math.PI) / 180;
+  // each polyline → a wide halo line + a thin bright core line
+  const segs = useMemo(() => {
+    const lines = buildNodePipes(layout, half, 0.22);   // sit just above the plot surface so they're visible
+    return lines.flatMap((pts) => [{ pts, halo: true }, { pts, halo: false }]);
+  }, [layout, half]);
+
+  useFrame((_, dt) => {
+    const d = useTwinStore.getState().byId[deviceId] || {};
+    const active = d.status === 'online' && ((d.pump ?? d.pump_state) === 'on' || (d.valve ?? d.valve_state) === 'open');
+    for (let i = 0; i < refs.current.length; i++) {
+      const ln = refs.current[i]; if (!ln) continue;
+      const halo = segs[i]?.halo;
+      const mat = ln.material;
+      if (active && !halo) mat.dashOffset -= dt * 2.4;     // only the core scrolls
+      const tgt = halo
+        ? (active ? 0.5 : 0.16 + ENV.night * 0.14)
+        : (active ? 1.0 : 0.5 + ENV.night * 0.3);
+      mat.opacity = THREE.MathUtils.lerp(mat.opacity, tgt, Math.min(1, dt * 4));
+      mat.color.set(active ? WATER_GLOW : WATER_DEEP);
+    }
+  });
+
+  if (!pos) return null;
+  return (
+    <group position={[pos[0], 0, pos[2]]} rotation={[0, rot, 0]}>
+      {segs.map((s, i) => (
+        <Line key={i} ref={(el) => (refs.current[i] = el)} points={s.pts}
+          color={WATER_GLOW} lineWidth={s.halo ? 6.5 : 2.6}
+          dashed={!s.halo} dashSize={0.3} gapSize={0.16}
+          transparent opacity={s.halo ? 0.05 : 0.14} depthWrite={false} />
+      ))}
+    </group>
+  );
+}
+
 function FlowPipe({ from, to, clusterNodeIds }) {
   const lineRef = useRef();
+  const haloRef = useRef();
   const tubeRef = useRef();
   const { mid, len, quat } = useMemo(() => {
     const a = new THREE.Vector3(...from), b = new THREE.Vector3(...to);
@@ -1413,22 +1674,26 @@ function FlowPipe({ from, to, clusterNodeIds }) {
     const byId = useTwinStore.getState().byId;
     const active = clusterNodeIds.some((nid) => {
       const d = byId[nid];
-      return (d?.pump ?? d?.pump_state) === 'on' || (d?.valve ?? d?.valve_state) === 'open';
+      return d?.status === 'online' && ((d?.pump ?? d?.pump_state) === 'on' || (d?.valve ?? d?.valve_state) === 'open');
     });
     const m = lineRef.current.material;
-    if (active) m.dashOffset -= dt * 1.6;                       // scroll = flow
-    // brighter when flowing; at night the idle pipes still softly glow
-    m.opacity = THREE.MathUtils.lerp(m.opacity, active ? 0.95 : 0.1 + ENV.night * 0.3, Math.min(1, dt * 4));
-    if (tubeRef.current) tubeRef.current.emissiveIntensity = ENV.night * (active ? 0.9 : 0.4) + (active ? 0.5 : 0);
+    if (active) m.dashOffset -= dt * 1.8;                       // scroll = flow
+    // vivid when flowing; at night the idle mains still softly glow
+    m.opacity = THREE.MathUtils.lerp(m.opacity, active ? 1.0 : 0.12 + ENV.night * 0.32, Math.min(1, dt * 4));
+    m.color.set(active ? WATER_GLOW : WATER_DEEP);
+    if (haloRef.current) haloRef.current.material.opacity = THREE.MathUtils.lerp(haloRef.current.material.opacity, active ? 0.42 : 0.06, Math.min(1, dt * 4));
+    if (tubeRef.current) tubeRef.current.emissiveIntensity = ENV.night * (active ? 1.1 : 0.4) + (active ? 0.85 : 0);
   });
 
   return (
     <group>
       <mesh position={mid} quaternion={quat}>
         <cylinderGeometry args={[PIPE_R, PIPE_R, len, 12, 1, true]} />
-        <meshStandardMaterial ref={tubeRef} color="#9fb6c9" emissive={NEON_BLUE} emissiveIntensity={0} transparent opacity={0.22} roughness={0.15} metalness={0.2} side={THREE.DoubleSide} depthWrite={false} />
+        <meshStandardMaterial ref={tubeRef} color="#bfe9f7" emissive={WATER_GLOW} emissiveIntensity={0} transparent opacity={0.24} roughness={0.12} metalness={0.2} side={THREE.DoubleSide} depthWrite={false} />
       </mesh>
-      <Line ref={lineRef} points={[from, to]} color={NEON_BLUE} lineWidth={2.4} dashed dashSize={0.4} gapSize={0.24} transparent opacity={0.1} depthWrite={false} />
+      {/* soft glow halo under the bright core */}
+      <Line ref={haloRef} points={[from, to]} color={WATER_GLOW} lineWidth={7} transparent opacity={0.06} depthWrite={false} />
+      <Line ref={lineRef} points={[from, to]} color={WATER_GLOW} lineWidth={3.2} dashed dashSize={0.42} gapSize={0.22} transparent opacity={0.12} depthWrite={false} />
     </group>
   );
 }
@@ -1436,6 +1701,9 @@ function FlowPipe({ from, to, clusterNodeIds }) {
 // Whole farm pipe network: gateway → its pump → each plot in its cluster.
 function PipeNetwork({ scene }) {
   const positions = useTwinStore((s) => s.positions);
+  // internal per-node pipelines: always in the Water layer, otherwise only when
+  // the (off-by-default) "Inner pipelines" feature is enabled in settings.
+  const showInner = useTwinStore((s) => (s.digital && (s.digitalLayer === 'water' || (s.digitalLayer === 'all' && s.allLayers.water))) || s.features.innerPipes);
   const { gwIds, nodeIds, nodeGw } = scene;
   const pipes = useMemo(() => {
     const out = [];
@@ -1457,6 +1725,10 @@ function PipeNetwork({ scene }) {
     <group>
       {pipes.map((p) => (
         <FlowPipe key={p.key} from={p.from} to={p.to} clusterNodeIds={p.cluster} />
+      ))}
+      {/* each node's own internal pipeline architecture, glowing when it opens */}
+      {showInner && nodeIds.map((id) => (
+        <NodeIrrigation key={`irr-${id}`} deviceId={id} />
       ))}
     </group>
   );
@@ -1513,24 +1785,23 @@ function RfWaves({ deviceId, baseColor, y = 1.66, maxR = 8, count = 3, interfere
   );
 }
 
-// Animated zigzag "sound-wave" signal between two radios with visible DATA
-// PACKETS riding the wave: cyan/magenta telemetry flowing node→gateway (uplink,
-// coloured by RSSI) and amber commands flowing gateway→node (downlink). The
-// polyline + the packets share the exact same wave function so packets sit on it.
+// Animated "sound-wave" link between two radios. The faint zig-zag line is the
+// idle RF channel; the bright travelling points are REAL packets — one point is
+// launched each time a genuine packet event is stamped in the store
+// (firePacket): uplink telemetry RX (node→gateway, RSSI-coloured) and downlink
+// command TX (gateway→node, amber). No live data ⇒ no points move.
 const WAVE_N = 56;
-const WAVE_PACKETS = [
-  { dir: -1, phase: 0.00, sp: 0.55 },   // uplink  (node → gateway)
-  { dir: -1, phase: 0.34, sp: 0.55 },
-  { dir: -1, phase: 0.68, sp: 0.55 },
-  { dir:  1, phase: 0.20, sp: 0.38 },   // downlink (gateway → node)
-  { dir:  1, phase: 0.70, sp: 0.38 },
-];
-function SignalWave({ fromKey, toKey, fromY, toY }) {
+const PULSE_MS   = 1500;   // travel time of one packet point along the link
+const PULSE_POOL = 8;      // max simultaneous points rendered per link
+function SignalWave({ fromKey, toKey, fromY, toY, downColor }) {
   const a = useTwinStore((s) => s.positions[fromKey]);
   const b = useTwinStore((s) => s.positions[toKey]);
   const lineRef = useRef();
   const pktRefs = useRef([]);
+  const pulses  = useRef([]);     // active packet points: { start, dir }
+  const lastTs  = useRef(0);      // last consumed packet-event timestamp
   const col = useMemo(() => new THREE.Color(), []);
+  const downCol = useMemo(() => new THREE.Color(downColor || '#fbbf24'), [downColor]);  // gateway→node colour
   const geo = useMemo(() => {
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(WAVE_N * 3), 3));
@@ -1538,8 +1809,10 @@ function SignalWave({ fromKey, toKey, fromY, toY }) {
   }, []);
   useFrame(() => {
     if (!a || !b || !lineRef.current) return;
-    const t = performance.now() * 0.001;
-    const d = useTwinStore.getState().byId[toKey] || {};
+    const now = performance.now();
+    const t = now * 0.001;
+    const st = useTwinStore.getState();
+    const d = st.byId[toKey] || {};
     const offline = d.status === 'offline';
     const ax = a[0], az = a[2], bx = b[0], bz = b[2];
     const dx = bx - ax, dz = bz - az;
@@ -1547,7 +1820,7 @@ function SignalWave({ fromKey, toKey, fromY, toY }) {
     const px = -dz / len, pz = dx / len;            // horizontal perpendicular
     const amp = offline ? 0 : Math.min(0.7, len * 0.07);
     const cyc = Math.max(4, Math.round(len * 0.9));
-    // shared wave function → both the line and the packets sample this
+    // shared wave function → both the line and the points sample this
     const wave = (s, out) => {
       const env = Math.sin(s * Math.PI);
       const ph  = s * Math.PI * 2 * cyc - t * 7;
@@ -1564,21 +1837,31 @@ function SignalWave({ fromKey, toKey, fromY, toY }) {
     geo.computeBoundingSphere();
     col.copy(offline ? RF_OFF : (rssiQuality(d.rssi ?? d.lora_rssi) > 0.5 ? RF_STRONG : RF_WEAK));
     lineRef.current.material.color.copy(col);
-    lineRef.current.material.opacity = offline ? 0.22 : 0.4 + 0.12 * Math.sin(t * 4);
+    lineRef.current.material.opacity = offline ? 0.18 : 0.18 + 0.06 * Math.sin(t * 4);   // dim idle channel
 
-    // data packets travelling along the wave
-    for (let i = 0; i < WAVE_PACKETS.length; i++) {
+    // ── launch a point for each REAL packet event on this node (toKey) ──
+    const ev = st.packets[toKey];
+    if (ev && ev.ts > lastTs.current) {
+      lastTs.current = ev.ts;
+      if (!offline && pulses.current.length < PULSE_POOL) pulses.current.push({ start: now, dir: ev.dir ?? -1 });
+    }
+    // drop finished points
+    pulses.current = pulses.current.filter((p) => now - p.start < PULSE_MS);
+    // render the active points riding the wave
+    for (let i = 0; i < PULSE_POOL; i++) {
       const m = pktRefs.current[i]; if (!m) continue;
-      if (offline) { m.visible = false; continue; }
+      const p = pulses.current[i];
+      if (!p || offline) { m.visible = false; continue; }
+      const u = (now - p.start) / PULSE_MS;
+      const s = p.dir < 0 ? 1 - u : u;               // uplink travels node→gateway (s:1→0)
+      wave(s, tmp);
       m.visible = true;
-      const pk = WAVE_PACKETS[i];
-      const u = (t * pk.sp + pk.phase) % 1;
-      const s = pk.dir < 0 ? 1 - u : u;              // uplink travels node→gateway
-      const env = wave(s, tmp);
       m.position.set(tmp[0], tmp[1], tmp[2]);
-      m.material.opacity = env * (pk.dir < 0 ? 0.95 : 0.7);
-      m.material.color.copy(pk.dir < 0 ? col : RF_DOWN);
-      const sc = pk.dir < 0 ? 0.55 : 0.42; m.scale.set(sc, sc, sc);
+      const fade = Math.sin(u * Math.PI);            // fade in at launch, out at arrival
+      m.material.opacity = Math.max(0, fade) * (p.dir < 0 ? 1.0 : 0.9);
+      m.material.color.copy(p.dir < 0 ? col : downCol);   // uplink = RSSI colour, downlink = gateway colour
+      const sc = (p.dir < 0 ? 0.85 : 0.65) * (0.55 + fade * 0.6);
+      m.scale.set(sc, sc, sc);
     }
   });
   if (!a || !b) return null;
@@ -1587,7 +1870,7 @@ function SignalWave({ fromKey, toKey, fromY, toY }) {
       <line ref={lineRef} geometry={geo} frustumCulled={false}>
         <lineBasicMaterial transparent opacity={0.5} depthWrite={false} blending={THREE.AdditiveBlending} />
       </line>
-      {WAVE_PACKETS.map((_, i) => (
+      {Array.from({ length: PULSE_POOL }).map((_, i) => (
         <sprite key={i} ref={(el) => (pktRefs.current[i] = el)} visible={false}>
           <spriteMaterial map={GLOW_TEX} transparent opacity={0} depthWrite={false} blending={THREE.AdditiveBlending} />
         </sprite>
@@ -1618,7 +1901,8 @@ function SignalSpectrum({ scene }) {
       {nodeIds.map((id) => <NoSignalTag key={`ns${id}`} deviceId={id} />)}
       {links.map((l) => (
         <SignalWave key={`${l.fromKey}->${l.toKey}`} fromKey={l.fromKey} toKey={l.toKey}
-          fromY={lampHeight(l.fromKey, gwSet)} toY={lampHeight(l.toKey, gwSet)} />
+          fromY={lampHeight(l.fromKey, gwSet)} toY={lampHeight(l.toKey, gwSet)}
+          downColor={gwColor[l.gwKey]} />
       ))}
     </group>
   );
@@ -1761,15 +2045,103 @@ function PlanetarySky({ clock }) {
 // world … 1=digital world), darkens the sky toward a cyber void, and fills the
 // air with drifting data particles. Lights/ground/crops elsewhere read ENV.digital.
 const DIGI_DARK = new THREE.Color('#06070f');   // cyber-void sky in the digital layer
+// LAYER · SLEEP — floating badge over each node showing its duty-cycle state,
+// read from the store's sleepCfg (populated by the SleepHUD scheduler).
+function SleepTags({ scene }) {
+  const positions = useTwinStore((s) => s.positions);
+  const sleepCfg  = useTwinStore((s) => s.sleepCfg);
+  const byId      = useTwinStore((s) => s.byId);
+  const [, setTick] = useState(0);
+  useEffect(() => { const t = setInterval(() => setTick((n) => n + 1), 1000); return () => clearInterval(t); }, []);
+  return (
+    <group>
+      {scene.nodeIds.map((id) => {
+        const p = positions[id]; if (!p) return null;
+        const c = sleepCfg[id] || {};
+        const st = sleepCycleState(c, byId[id]);
+        const sleeping = st ? st.sleeping : (c.state === 'sleeping' || c.enabled);
+        return (
+          <Html key={id} position={[p[0], 2.0, p[2]]} center distanceFactor={15} className="pointer-events-none select-none">
+            <div className={`px-2 py-1 rounded-lg text-[9px] font-mono text-center whitespace-nowrap shadow-lg ring-1 ${st ? (sleeping ? 'bg-indigo-950/85 ring-indigo-400/50 text-indigo-200' : 'bg-emerald-950/80 ring-emerald-400/40 text-emerald-200') : 'bg-slate-900/80 ring-slate-500/40 text-slate-300'}`}>
+              <div className="font-bold">{st ? (sleeping ? '💤 SLEEPING' : '☀ AWAKE') : '☀ awake (no sleep)'}</div>
+              {st && <div className="text-indigo-300/90">{st.label}</div>}
+              {st && <div className="text-[8px] text-slate-400/90">awake {c.awakeMin || 1}m · sleep {c.sleepMin || 15}m</div>}
+            </div>
+          </Html>
+        );
+      })}
+    </group>
+  );
+}
+
+// Sleep-layer scheduler panel: per-node wake interval + daily window + manual
+// sleep/wake. Reuses SleepControl (which syncs each node's config to the store
+// so SleepTags update live).
+function SleepHUD({ nodeIds }) {
+  const byId = useTwinStore((s) => s.byId);
+  return (
+    <div className="absolute top-16 right-3 z-10 w-80 rounded-2xl bg-slate-900/85 backdrop-blur-xl shadow-2xl ring-1 ring-indigo-400/30 p-3 max-h-[80vh] overflow-auto">
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-indigo-300 font-bold text-xs tracking-[0.15em]">💤 SLEEP SCHEDULER</span>
+        <span className="text-[10px] font-mono text-indigo-400/70">duty-cycle</span>
+      </div>
+      <div className="space-y-2.5">
+        {nodeIds.length === 0 && <div className="text-[10px] text-slate-500">No nodes on this farm</div>}
+        {nodeIds.map((id) => {
+          const d = byId[id] || {};
+          if (!d._id) return <div key={id} className="text-[10px] text-slate-500 px-1">{d.name || id} — not registered</div>;
+          return (
+            <div key={id}>
+              <div className="text-[11px] text-indigo-100 font-semibold px-1 mb-0.5 flex items-center justify-between">
+                <span className="truncate">{d.name || id}</span>
+                <span className={`text-[9px] ${d.status === 'online' ? 'text-emerald-400' : 'text-slate-500'}`}>● {d.status || 'unknown'}</span>
+              </div>
+              <SleepControl nodeId={d._id} online={d.status === 'online'} deviceId={id} />
+            </div>
+          );
+        })}
+      </div>
+      <div className="text-[9px] text-slate-500 mt-2">Each node wakes on its interval to report &amp; accept commands, then sleeps again. Daily window sleeps/wakes at the set times (server time).</div>
+    </div>
+  );
+}
+
 const DIGI_LAYERS = [
+  ['all',        '🌐', 'All',        '#e2e8f0'],
   ['comms',      '📡', 'Comms',      '#22e0ff'],
   ['water',      '🌊', 'Water',      '#38bdf8'],
   ['ai',         '🧠', 'AI Brain',   '#a855f7'],
   ['climate',    '🌫', 'Climate',    '#5eead4'],
   ['energy',     '⚡', 'Energy',     '#ffd54a'],
+  ['sleep',      '💤', 'Sleep',      '#818cf8'],
   ['prediction', '🔮', 'Prediction', '#f472b6'],
   ['biology',    '🌱', 'Biology',    '#84cc16'],
 ];
+
+// "All" layer control: show/hide each overlay together (like the settings gear).
+function AllLayersPanel() {
+  const allLayers = useTwinStore((s) => s.allLayers);
+  const toggle    = useTwinStore((s) => s.toggleAllLayer);
+  const items = DIGI_LAYERS.filter(([k]) => k !== 'all');
+  return (
+    <div className="absolute top-16 right-3 z-10 w-52 rounded-2xl bg-slate-900/85 backdrop-blur-xl shadow-2xl ring-1 ring-white/15 p-3">
+      <div className="text-slate-200 font-bold text-xs tracking-[0.15em] mb-2">🌐 ALL LAYERS</div>
+      <div className="space-y-0.5">
+        {items.map(([k, icon, label, color]) => (
+          <button key={k} onClick={() => toggle(k)} className="w-full flex items-center justify-between px-2 py-1.5 rounded-lg hover:bg-white/5 transition-colors">
+            <span className="flex items-center gap-2 text-[12px] font-medium" style={{ color: allLayers[k] ? color : '#64748b' }}>
+              <span className="text-base leading-none" style={{ filter: allLayers[k] ? 'none' : 'grayscale(0.6) opacity(0.6)' }}>{icon}</span>{label}
+            </span>
+            <span className={`w-8 h-4 rounded-full relative transition-colors ${allLayers[k] ? 'bg-emerald-500' : 'bg-slate-600'}`}>
+              <span className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${allLayers[k] ? 'left-4' : 'left-0.5'}`} />
+            </span>
+          </button>
+        ))}
+      </div>
+      <div className="text-[9px] text-slate-500 mt-2">Overlay several hidden systems at once.</div>
+    </div>
+  );
+}
 
 function DigitalController({ active }) {
   const sparkRef = useRef();
@@ -1918,15 +2290,127 @@ function PredictionGhosts({ scene }) {
   );
 }
 
+/* ------------------------------------------ Future Reality (3-day forecast) */
+// Turn a daily-forecast entry into the weather object the 3D WeatherSystem +
+// sky consume, so previewing a future day re-skins the whole scene.
+function conditionCloud(cond) {
+  switch (cond) {
+    case 'clear':         return 5;
+    case 'partly_cloudy': return 40;
+    case 'cloudy':        return 85;
+    case 'fog':           return 95;
+    case 'drizzle':       return 80;
+    case 'rain':          return 90;
+    case 'snow':          return 90;
+    case 'thunderstorm':  return 96;
+    default:              return 30;
+  }
+}
+function forecastToWeather(day) {
+  const cond = day.condition || 'clear';
+  const rain = (cond === 'rain' || cond === 'thunderstorm') ? 3.5 : cond === 'drizzle' ? 1.2 : 0;
+  return {
+    condition: cond,
+    cloudCover: conditionCloud(cond),
+    precipitation: rain, rain,
+    windSpeed: day.windMax ?? 8,
+    windDirection: 90,
+    isDay: true,
+    temperature: day.tempMax,
+    __future: true,
+  };
+}
+const COND_ICON = { clear: '☀️', partly_cloudy: '⛅', cloudy: '☁️', fog: '🌫️', drizzle: '🌦️', rain: '🌧️', snow: '❄️', thunderstorm: '⛈️' };
+const FUTURE_NAMES = ['Tomorrow', 'In 2 days', 'In 3 days'];
+
+// Bottom-center panel in the Prediction layer: real Open-Meteo 3-day forecast.
+// Tapping a day locks the scene to that day's predicted sky/weather/solar; NOW
+// returns to live conditions. Leaving the layer restores live automatically.
+function FuturePanel() {
+  const forecast        = useTwinStore((s) => s.forecast);
+  const futureDay       = useTwinStore((s) => s.futureDay);
+  const setFutureDay    = useTwinStore((s) => s.setFutureDay);
+  const setWeather      = useTwinStore((s) => s.setWeather);
+  const setWeatherLocked= useTwinStore((s) => s.setWeatherLocked);
+  const liveRef = useRef(null);
+
+  const days = forecast.slice(1, 4);   // index 0 = today; preview the next 3 days
+
+  const goNow = () => {
+    setFutureDay(0);
+    setWeatherLocked(false);
+    if (liveRef.current) setWeather(liveRef.current);
+    liveRef.current = null;
+  };
+  const goDay = (i) => {
+    const day = days[i]; if (!day) return;
+    if (useTwinStore.getState().futureDay === 0) liveRef.current = useTwinStore.getState().weather;
+    setFutureDay(i + 1);
+    setWeather(forecastToWeather(day));
+    setWeatherLocked(true);
+  };
+  // restore live conditions when leaving the prediction layer
+  useEffect(() => () => {
+    if (useTwinStore.getState().futureDay !== 0) {
+      setFutureDay(0);
+      setWeatherLocked(false);
+      if (liveRef.current) setWeather(liveRef.current);
+    }
+  }, [setWeather, setWeatherLocked, setFutureDay]);
+
+  return (
+    <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-10 rounded-2xl bg-slate-950/85 backdrop-blur-xl ring-1 ring-pink-400/30 p-3 shadow-2xl">
+      <div className="flex items-center justify-between mb-2 gap-6">
+        <span className="text-pink-300 font-bold text-xs tracking-[0.15em]">🔮 FUTURE REALITY · 3-DAY FORECAST</span>
+        <button onClick={goNow}
+          className={`text-[10px] font-semibold px-2 py-0.5 rounded-lg transition-all ${futureDay === 0 ? 'bg-emerald-500/80 text-white' : 'bg-white/10 text-slate-300 hover:bg-white/20'}`}>● NOW</button>
+      </div>
+      <div className="flex gap-2">
+        {days.length === 0 && <div className="text-[10px] text-slate-500 py-3 px-2">Forecast unavailable — the farm needs map coordinates set.</div>}
+        {days.map((day, i) => {
+          const active = futureDay === i + 1;
+          return (
+            <button key={day.date} onClick={() => goDay(i)}
+              className="w-28 rounded-xl p-2 text-left transition-all ring-1"
+              style={{ background: active ? 'rgba(244,114,182,0.18)' : 'rgba(255,255,255,0.05)', boxShadow: active ? '0 0 16px rgba(244,114,182,0.4)' : 'none', borderColor: active ? '#f472b6' : 'transparent' }}>
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] font-semibold text-slate-200">{FUTURE_NAMES[i]}</span>
+                <span className="text-lg leading-none">{COND_ICON[day.condition] || '🌤️'}</span>
+              </div>
+              <div className="text-[9px] text-slate-400 mt-0.5 capitalize">{(day.condition || '').replace('_', ' ')}</div>
+              <div className="flex justify-between mt-1 text-[11px] font-mono">
+                <span className="text-rose-300">{day.tempMax != null ? `${Math.round(day.tempMax)}°` : '—'}</span>
+                <span className="text-sky-300">{day.tempMin != null ? `${Math.round(day.tempMin)}°` : '—'}</span>
+              </div>
+              <div className="flex justify-between mt-1 text-[9px] font-mono text-slate-400">
+                <span title="rain chance">💧{day.precipProb ?? 0}%</span>
+                <span title="solar charging potential" className="text-yellow-300/80">☀{day.solarScore != null ? Math.round(day.solarScore * 100) : '—'}%</span>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+      <div className="text-[9px] text-slate-500 mt-1.5">
+        {futureDay === 0
+          ? 'Showing live conditions — tap a day to preview its sky, weather & solar charging.'
+          : `Previewing ${FUTURE_NAMES[futureDay - 1]} — sky, clouds & rain reflect the real forecast. ☀ = solar charging potential.`}
+      </div>
+    </div>
+  );
+}
+
 /* ----------------------------------------------------------------- 3D scene */
-function Scene({ scene, editMode, onSelect, onCommit, clock, cinematic }) {
+function Scene({ scene, editMode, onSelect, onCommit, clock, cinematic, onValve }) {
   const { nodeIds, gwIds, links, gwColor } = scene;
   const selectedId  = useTwinStore((s) => s.selectedId);
   const digital      = useTwinStore((s) => s.digital);
   const digitalLayer = useTwinStore((s) => s.digitalLayer);
+  const allLayers    = useTwinStore((s) => s.allLayers);
   const setPosition = useTwinStore((s) => s.setPosition);
   const setDragging = useTwinStore((s) => s.setDragging);
   const feat        = useTwinStore((s) => s.features);
+  // a layer shows if it's the active layer, or it's enabled inside the "All" layer
+  const showL = (k) => digital && (digitalLayer === k || (digitalLayer === 'all' && allLayers[k]));
 
   const { camera, gl, raycaster } = useThree();
   const plane = useMemo(() => new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), []);
@@ -1976,17 +2460,20 @@ function Scene({ scene, editMode, onSelect, onCommit, clock, cinematic }) {
       <SkyAndSun clock={clock} />
       <PlanetarySky clock={clock} />
       <DigitalController active={digital} />
-      {feat.weather && (!digital || digitalLayer === 'climate') && <WeatherSystem />}
+      {feat.weather && (!digital || showL('climate')) && <WeatherSystem />}
 
       {feat.ground && <Ground />}
       <Grid position={[0, 0.01, 0]} infiniteGrid cellSize={1} sectionSize={5} fadeDistance={95} fadeStrength={1.6} cellColor="#bcc6b2" sectionColor="#9aa888" />
 
-      {(feat.pipes || (digital && digitalLayer === 'water')) && <PipeNetwork scene={scene} />}
-      {digital && digitalLayer === 'comms' && <SignalSpectrum scene={scene} />}
-      {digital && digitalLayer === 'ai'         && <AiNeural scene={scene} />}
-      {digital && digitalLayer === 'biology'    && <Roots scene={scene} />}
-      {digital && digitalLayer === 'prediction' && <PredictionGhosts scene={scene} />}
-      {digital && digitalLayer === 'energy' && <EnergyTags scene={scene} />}
+      {(feat.pipes || showL('water')) && <PipeNetwork scene={scene} />}
+      {showL('comms')      && <SignalSpectrum scene={scene} />}
+      {showL('ai')         && <AiNeural scene={scene} />}
+      {showL('biology')    && <Roots scene={scene} />}
+      {showL('prediction') && <PredictionGhosts scene={scene} />}
+      {/* In the 🌐 "All" layer these per-node tags are folded into AllLayerHud,
+          so render them only in their own dedicated layer to avoid stacking. */}
+      {showL('energy')     && digitalLayer !== 'all' && <EnergyTags scene={scene} />}
+      {showL('sleep')      && digitalLayer !== 'all' && <SleepTags scene={scene} />}
 
       <CinematicDirector controlsRef={controlsRef} scene={scene} cinematic={cinematic} editMode={editMode} />
 
@@ -1998,7 +2485,7 @@ function Scene({ scene, editMode, onSelect, onCommit, clock, cinematic }) {
         <NodeMarker
           key={id} deviceId={id} gwColor={gwColor[scene.nodeGw[id]]}
           selected={selectedId === id} editMode={editMode}
-          onSelect={onSelect} onBeginDrag={beginDrag}
+          onSelect={onSelect} onBeginDrag={beginDrag} onValve={onValve}
         />
       ))}
 
@@ -2033,6 +2520,46 @@ function fmtMin(m) {
   if (h > 0) return `${h}h ${mm}m`;
   return `${mm}m`;
 }
+// seconds → "1h 5m" / "50m 12s" / "8s" — hides empty leading units (no "0h").
+function fmtDur(sec) {
+  sec = Math.max(0, Math.round(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
+}
+// Resolve the live duty-cycle phase for a sleeping node. Returns
+// { sleeping, remaining (s), label } or null if not in sleep mode.
+//
+// Preferred source = the node's OWN clock, reported over LoRa in each packet
+// (slpOn/slpAwk/slpNap/slpUp + slpStamp = arrival time). We extrapolate from
+// that anchor, so the countdown matches the device and re-syncs every packet.
+// Falls back to a config-based estimate for older firmware that doesn't report.
+function sleepCycleState(cfg, dev) {
+  if (!cfg || !(cfg.enabled || cfg.state === 'sleeping')) return null;
+
+  if (dev && dev.slpOn && dev.slpAwk != null && dev.slpStamp) {
+    const awakeSec = dev.slpAwk;
+    const sleepSec = dev.slpNap ?? ((cfg.sleepMin ?? 15) * 60);
+    const since = (Date.now() - dev.slpStamp) / 1000;       // s since this report
+    const up    = (dev.slpUp || 0) + since;                 // s awake this cycle now
+    if (up < awakeSec)            return { sleeping: false, remaining: awakeSec - up,            label: `sleeps in ${fmtDur(awakeSec - up)}` };
+    if (up < awakeSec + sleepSec) return { sleeping: true,  remaining: awakeSec + sleepSec - up, label: `wakes in ${fmtDur(awakeSec + sleepSec - up)}` };
+    return { sleeping: true, remaining: 0, label: 'waking…' };
+  }
+
+  const bands = Array.isArray(cfg.bands) ? cfg.bands : [];
+  const nowMins = (() => { const d = new Date(); return d.getHours() * 60 + d.getMinutes(); })();
+  const band = bands.length ? activeBand(bands, nowMins) : null;
+  const awakeSec = (band?.awakeMin ?? cfg.awakeMin ?? 1) * 60;
+  const sleepSec = (band?.sleepMin ?? cfg.sleepMin ?? 15) * 60;
+  const wokeAt = dev?.wokeAt || dev?.lastUpdate;
+  if (!wokeAt) return { sleeping: true, remaining: sleepSec, label: `sleep ${fmtDur(sleepSec)}` };
+  const elapsed = (Date.now() - wokeAt) / 1000;
+  if (elapsed < awakeSec) return { sleeping: false, remaining: awakeSec - elapsed, label: `sleeps in ${fmtDur(awakeSec - elapsed)}` };
+  if (elapsed < awakeSec + sleepSec) return { sleeping: true, remaining: awakeSec + sleepSec - elapsed, label: `wakes in ${fmtDur(awakeSec + sleepSec - elapsed)}` };
+  return { sleeping: true, remaining: 0, label: 'waking…' };
+}
 
 function Metric({ icon, label, value, accent }) {
   return (
@@ -2059,6 +2586,120 @@ function Sparkline({ data, color, w = 70, h = 22 }) {
     <svg width={w} height={h} className="block">
       <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" strokeLinejoin="round" strokeLinecap="round" />
     </svg>
+  );
+}
+
+// Example schedule: dense by day, sparser at night (awake 1m, sleep 5/10/15m).
+const BAND_PRESET = [
+  { start: '06:00', awakeMin: 1, sleepMin: 5 },
+  { start: '18:00', awakeMin: 1, sleepMin: 10 },
+  { start: '22:00', awakeMin: 1, sleepMin: 15 },
+];
+const hhmmMin = (s) => { const [h, m] = String(s || '0:0').split(':').map(Number); return (h || 0) * 60 + (m || 0); };
+// Resolve the active band's { awakeMin, sleepMin } for a minute-of-day (mirrors backend).
+function activeBand(bands, mins) {
+  const p = (bands || []).filter((b) => b && b.start)
+    .map((b) => ({ m: hhmmMin(b.start), awakeMin: b.awakeMin, sleepMin: b.sleepMin })).sort((a, b) => a.m - b.m);
+  if (!p.length) return null;
+  let cur = p[p.length - 1];
+  for (const b of p) { if (b.m <= mins) cur = b; else break; }
+  return cur;
+}
+
+// Deep-sleep duty cycle: a master ON/OFF toggle, awake + sleep durations
+// (e.g. awake 5m / sleep 1h), an optional 24h band schedule, and a live next-
+// wake estimate. Commands to a sleeping node are queued + delivered on its wake.
+function SleepControl({ nodeId, online, deviceId }) {
+  const [cfg, rawSetCfg] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg]   = useState('');
+  const [, tick] = useState(0);
+  const dev = useTwinStore((s) => (deviceId ? s.byId[deviceId] : null));
+  const setCfg = (next) => { rawSetCfg(next); if (deviceId && next) useTwinStore.getState().setSleepCfg(deviceId, next); };
+  useEffect(() => {
+    if (!nodeId) return;
+    let cancelled = false;
+    api.get(`/nodes/${nodeId}/sleep`).then((r) => { if (!cancelled) setCfg(r.data?.data?.sleep || {}); }).catch(() => {});
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [nodeId]);
+  useEffect(() => { const t = setInterval(() => tick((n) => n + 1), 1000); return () => clearInterval(t); }, []);
+  if (!nodeId) return null;
+  const c = cfg || {};
+  const bands = Array.isArray(c.bands) ? c.bands : [];
+  const set = (patch) => setCfg({ ...c, ...patch });
+  const flash = (m) => { setMsg(m); setTimeout(() => setMsg(''), 2500); };
+  const sleeping = c.state === 'sleeping' || c.enabled;
+  const nowMins = (() => { const d = new Date(); return d.getHours() * 60 + d.getMinutes(); })();
+  const band = bands.length ? activeBand(bands, nowMins) : null;
+  const awakeMin = band?.awakeMin ?? c.awakeMin ?? 1;
+  const sleepMin = band?.sleepMin ?? c.sleepMin ?? 15;
+
+  // live phase countdown (awake→sleep / sleep→wake). Approximate (timer ±10%).
+  const sleepSt = sleepCycleState(c, dev);
+
+  const call = (p, ok) => { setBusy(true); p.then((r) => { setCfg(r.data?.data?.sleep || c); flash(ok); }).catch(() => flash('Failed')).finally(() => setBusy(false)); };
+  const save  = (enable) => call(api.put(`/nodes/${nodeId}/sleep`, { bands, awakeMin: +c.awakeMin || 1, sleepMin: +c.sleepMin || 15, ...(enable != null ? { enabled: enable } : {}) }), enable === true ? 'Sleep activated' : enable === false ? 'Sleep off' : 'Saved');
+  const toggle = () => (sleeping ? call(api.post(`/nodes/${nodeId}/sleep/wake`), 'Sleep off') : save(true));
+  const setBand = (i, patch) => { const b = bands.slice(); b[i] = { ...b[i], ...patch }; set({ bands: b }); };
+  const addBand = () => set({ bands: [...bands, { start: '12:00', awakeMin: 1, sleepMin: 15 }] });
+  const delBand = (i) => set({ bands: bands.filter((_, j) => j !== i) });
+
+  return (
+    <div className="px-3 pb-3">
+      <div className="rounded-xl bg-indigo-50/70 border border-indigo-100 p-3">
+        {/* master activate / deactivate toggle */}
+        <button onClick={toggle} disabled={busy || (!sleeping && !online)}
+          className={`w-full flex items-center justify-between px-3 py-2 rounded-lg font-semibold text-[12px] mb-2 transition-colors disabled:opacity-50 ${sleeping ? 'bg-indigo-500 text-white' : 'bg-white text-slate-600 border border-slate-200 hover:bg-slate-50'}`}>
+          <span>💤 Deep sleep mode</span>
+          <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${sleeping ? 'bg-white/25' : 'bg-slate-200 text-slate-500'}`}>{sleeping ? 'ON' : 'OFF'}</span>
+        </button>
+        {sleeping && (
+          <div className="text-[10px] text-indigo-600 mb-2 font-medium">
+            {sleepSt ? `${sleepSt.sleeping ? '💤' : '☀'} ${sleepSt.label} · ` : ''}awake {awakeMin}m / sleep {sleepMin}m{band ? ' (band)' : ''}
+          </div>
+        )}
+
+        {/* awake / sleep durations (used when no bands) */}
+        {bands.length === 0 && (
+          <div className="flex items-center gap-3 mb-2 text-[11px] text-slate-500">
+            <label className="flex items-center gap-1">Awake
+              <input type="number" min={0.1} step={0.5} value={c.awakeMin ?? 1} onChange={(e) => set({ awakeMin: e.target.value })} className="w-14 border border-slate-200 rounded-lg px-1.5 py-1 text-sm text-right" />m</label>
+            <label className="flex items-center gap-1">Sleep
+              <input type="number" min={0.2} step={1} value={c.sleepMin ?? 15} onChange={(e) => set({ sleepMin: e.target.value })} className="w-14 border border-slate-200 rounded-lg px-1.5 py-1 text-sm text-right" />m</label>
+          </div>
+        )}
+
+        {/* optional 24h band schedule (awake/sleep per time band). Empty = use
+            the single Awake/Sleep durations above. */}
+        <div className="flex items-center justify-between mb-1">
+          <span className="text-[11px] font-semibold text-slate-500">24h schedule</span>
+          {bands.length === 0
+            ? <button onClick={() => set({ bands: BAND_PRESET })} className="text-[10px] text-indigo-600 hover:underline">preset</button>
+            : <button onClick={() => set({ bands: [] })} className="text-[10px] text-rose-500 hover:underline">clear → simple</button>}
+        </div>
+        <div className="space-y-1 mb-1">
+          {bands.map((b, i) => (
+            <div key={i} className="flex items-center gap-1 text-[10px] text-slate-500">
+              <button onClick={() => delBand(i)} title="remove band" className="text-rose-400 hover:text-rose-600 text-base leading-none w-4 shrink-0">×</button>
+              <input type="time" value={b.start || '00:00'} onChange={(e) => setBand(i, { start: e.target.value })} className="border border-slate-200 rounded-lg px-1 py-1 text-xs shrink-0" />
+              <span className="shrink-0" title="awake minutes">a</span>
+              <input type="number" min={0.1} step={0.5} value={b.awakeMin ?? 1} onChange={(e) => setBand(i, { awakeMin: +e.target.value })} className="w-9 border border-slate-200 rounded-lg px-1 py-1 text-xs text-right shrink-0" />
+              <span className="shrink-0" title="sleep minutes">s</span>
+              <input type="number" min={0.2} step={1} value={b.sleepMin ?? 15} onChange={(e) => setBand(i, { sleepMin: +e.target.value })} className="w-9 border border-slate-200 rounded-lg px-1 py-1 text-xs text-right shrink-0" />
+              <span className="shrink-0">m</span>
+            </div>
+          ))}
+          <button onClick={addBand} className="text-[11px] text-indigo-600 hover:underline">+ add band</button>
+        </div>
+
+        <button onClick={() => save(null)} disabled={busy} className="w-full text-[12px] font-semibold py-1.5 rounded-lg bg-slate-700 text-white hover:bg-slate-800 disabled:opacity-40 mt-1">Save schedule</button>
+        {sleeping
+          ? <p className="text-[10px] text-slate-400 mt-1.5">Commands queue &amp; deliver on the next wake. Timer drifts ±10%.</p>
+          : (!online && <p className="text-[10px] text-slate-400 mt-1.5">Node must be online to activate sleep.</p>)}
+        {msg && <p className="text-[10px] text-emerald-600 mt-1 font-semibold">{msg}</p>}
+      </div>
+    </div>
   );
 }
 
@@ -2177,14 +2818,21 @@ function DetailPanel({ canControl, onValve, onClose }) {
         </div>
       </div>
 
-      {canControl && (
+      {canControl && status !== 'online' && (
+        <div className="px-3 pb-3">
+          <div className="w-full text-center text-[11px] text-slate-400 bg-slate-50 border border-slate-100 rounded-xl py-2.5">
+            🚫 Node is {status} — valve control unavailable
+          </div>
+        </div>
+      )}
+      {canControl && status === 'online' && (
         <div className="px-3 pb-3">
           {valveOpen ? (
             <button
               onClick={() => onValve(false)}
               className="w-full inline-flex items-center justify-center gap-2 text-sm font-semibold px-3 py-2.5 rounded-xl text-white shadow-lg transition-all active:scale-[.98] bg-gradient-to-r from-slate-600 to-slate-700 hover:from-slate-700 hover:to-slate-800 shadow-slate-500/20"
             >
-              ■ Close valve · stop pump
+              ■ Close valve
             </button>
           ) : asking ? (
             <div className="rounded-xl bg-sky-50/70 border border-sky-100 p-3 animate-[fadeIn_.15s_ease-out]">
@@ -2219,7 +2867,7 @@ function DetailPanel({ canControl, onValve, onClose }) {
                 disabled={pct === 0}
                 className="w-full inline-flex items-center justify-center gap-2 text-sm font-semibold px-3 py-2.5 rounded-xl text-white shadow-lg transition-all active:scale-[.98] bg-gradient-to-r from-sky-500 to-cyan-500 hover:from-sky-600 hover:to-cyan-600 shadow-sky-500/30 disabled:opacity-40 disabled:cursor-not-allowed"
               >
-                💧 Open valve to {pct}% · start pump
+                💧 Open valve to {pct}%
               </button>
             </div>
           ) : (
@@ -2227,11 +2875,13 @@ function DetailPanel({ canControl, onValve, onClose }) {
               onClick={() => { setPct(100); setAsking(true); }}
               className="w-full inline-flex items-center justify-center gap-2 text-sm font-semibold px-3 py-2.5 rounded-xl text-white shadow-lg transition-all active:scale-[.98] bg-gradient-to-r from-sky-500 to-cyan-500 hover:from-sky-600 hover:to-cyan-600 shadow-sky-500/30"
             >
-              💧 Open valve · start pump
+              💧 Open valve
             </button>
           )}
         </div>
       )}
+
+      {canControl && <SleepControl nodeId={sel._id} online={status === 'online'} deviceId={sel.device_id} />}
     </div>
   );
 }
@@ -2347,6 +2997,19 @@ function CustomizePanel({ deviceId, onSave, onClose }) {
           ))}
         </div>
         <p className="text-[10px] text-slate-400 mt-3 leading-relaxed">“Auto” colours the plot by status — green online, red offline. Changes save automatically.</p>
+
+        {/* irrigation pipeline architecture (inside this plot) */}
+        <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-400 mt-4 mb-1.5">💧 Pipelines (inside plot)</label>
+        <div className="grid grid-cols-4 gap-1.5">
+          {PIPE_LAYOUTS.map((k) => (
+            <button key={k} onClick={() => update({ pipeLayout: k })}
+              className={`flex flex-col items-center gap-0.5 py-1.5 rounded-lg border text-[10px] capitalize transition-all ${
+                (cust.pipeLayout || 'comb') === k ? 'bg-cyan-500 text-white border-cyan-500 shadow' : 'bg-white text-slate-600 border-slate-200 hover:border-cyan-200'}`}>
+              <span className="text-base leading-none">{PIPE_ICON[k]}</span>{k}
+            </button>
+          ))}
+        </div>
+        <p className="text-[10px] text-slate-400 mt-2">Pipelines glow & flow when this node’s valve/pump opens (Water layer).</p>
       </div>
     </div>
   );
@@ -2619,6 +3282,7 @@ const FEATURE_LIST = [
   ['ground',  '🟫 Ground'],
   ['crops',   '🌱 Crops'],
   ['pipes',   '🚰 Pipes & flow'],
+  ['innerPipes', '💧 Inner pipelines'],
   ['energy',  '⚡ Solar / energy'],
   ['labels',  '🏷️ Labels'],
 ];
@@ -3096,6 +3760,16 @@ export default function FarmTwinPage() {
     return () => { cancelled = true; };
   }, [farmId, setWeather]);
 
+  // Real Open-Meteo 3-day daily forecast for the Future Reality overlay.
+  useEffect(() => {
+    if (!farmId) return;
+    let cancelled = false;
+    api.get(`/weather/${farmId}/daily`)
+      .then((r) => { if (!cancelled) useTwinStore.getState().setForecast(r.data?.data?.daily || []); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [farmId]);
+
   useEffect(() => {
     api.get('/farms')
       .then((r) => {
@@ -3137,6 +3811,7 @@ export default function FarmTwinPage() {
             color: t.color || null,
             label: t.label || '',
             crop:  t.crop || null,
+            pipeLayout: t.pipes || null,
           };
         });
 
@@ -3150,6 +3825,9 @@ export default function FarmTwinPage() {
         seed([...nodes, ...gws]);
         setPositions(positions);
         setCustomMap(custom);
+        // seed each node's sleep config so the reality 💤 + countdown work
+        // without opening the Sleep layer first
+        nodes.forEach((n) => { if (n.sleep) useTwinStore.getState().setSleepCfg(n.device_id, n.sleep); });
         setScene({ nodeIds: nodes.map((n) => n.device_id), gwIds: gws.map((g) => g.device_id), links, gwColor, nodeGw });
       })
       .catch((e) => { if (!cancelled) setError(e.response?.data?.message || e.message); })
@@ -3183,6 +3861,7 @@ export default function FarmTwinPage() {
         color: c.color || null,
         label: c.label || '',
         crop: c.crop || null,
+        pipes: c.pipeLayout || null,
       } };
     }
     const url = meta.type === 'gateway' ? `/farms/${farmId}/gateways/${meta._id}` : `/farms/${farmId}/nodes/${meta._id}`;
@@ -3196,36 +3875,39 @@ export default function FarmTwinPage() {
   // it ignores pump_start if already running). Closing ONLY stops the pump when
   // no other node in the farm still has a valve open — this prevents the shared
   // pump from being cut while other sections are still irrigating.
-  const setValve = useCallback((open, percent = 100) => {
-    const id = selectedId;
+  // Issue a valve command to a specific node. Used by both the detail panel
+  // (for the selected node) and the per-node "All" layer HUDs.
+  const handleValve = useCallback((deviceId, open, percent = 100) => {
+    const id = deviceId;
     const meta = id ? metaRef.current[id] : null;
     if (!meta || meta.type !== 'node') return;
-    const pct = Math.max(0, Math.min(100, Math.round(percent)));
-    apply(id, open ? { valve: 'open', valve_pct: pct, pump: 'on' } : { valve: 'closed', valve_pct: 0, pump: 'off' });
-
-    // Send valve command (percent in body → forwarded as MQTT payload to device)
-    api.post(`/nodes/${meta._id}/${open ? 'valve/open' : 'valve/close'}`, open ? { percent: pct } : {})
-      .catch((e) => toast(`Valve failed: ${e.response?.data?.message || e.message}`, 3000));
-
-    if (open) {
-      // Firmware is idempotent: if pump relay is already ON it won't re-trigger
-      api.post(`/nodes/${meta._id}/pump/start`)
-        .then(() => toast(`Valve opened ${pct}% · pump started`))
-        .catch((e) => toast(`Pump failed: ${e.response?.data?.message || e.message}`, 3000));
-    } else {
-      // Check if any other node still has an open valve before killing the pump
-      const byId = useTwinStore.getState().byId;
-      const otherNodes = Object.keys(metaRef.current).filter((k) => metaRef.current[k].type === 'node' && k !== id);
-      const anyOpen = otherNodes.some((nid) => (byId[nid]?.valve ?? byId[nid]?.valve_state) === 'open');
-      if (anyOpen) {
-        toast('Valve closed · pump still running (other sections open)', 2500);
-      } else {
-        api.post(`/nodes/${meta._id}/pump/stop`)
-          .then(() => toast('Valve closed · pump stopped'))
-          .catch((e) => toast(`Pump failed: ${e.response?.data?.message || e.message}`, 3000));
-      }
+    const store = useTwinStore.getState();
+    // an unknown/offline node has no link — refuse the command (no flow either).
+    const sleepCfg = store.sleepCfg[id] || {};
+    const sleepingNode = sleepCfg.enabled || sleepCfg.state === 'sleeping';
+    // Allow commanding a sleeping node — the backend queues it for the next wake.
+    if ((store.byId[id]?.status || 'unknown') !== 'online' && !sleepingNode) {
+      toast('Node is not online — no valve command sent', 2500);
+      return;
     }
-  }, [selectedId, apply, toast]);
+    const pct = Math.max(0, Math.min(100, Math.round(percent)));
+    // sticky override + optimistic state in one atomic update (pump-free: the
+    // valve alone drives the flow). This flips the button immediately.
+    store.commandValve(id, open, pct);
+    store.firePacket(id, 1);               // gateway → node command packet (downlink)
+
+    // Send the valve command only (no pump). Percent → MQTT payload to the device.
+    api.post(`/nodes/${meta._id}/${open ? 'valve/open' : 'valve/close'}`, open ? { percent: pct } : {})
+      .then((r) => {
+        const queued = r.data?.data?.delivery === 'queued';
+        toast(queued ? '⏳ Queued — delivers on the node’s next wake'
+                     : (open ? `Valve opened ${pct}%` : 'Valve closed'), queued ? 3000 : 1500);
+      })
+      .catch((e) => toast(`Valve failed: ${e.response?.data?.message || e.message}`, 3000));
+  }, [toast]);
+
+  // The detail panel always controls the currently-selected node.
+  const setValve = useCallback((open, percent = 100) => handleValve(selectedId, open, percent), [handleValve, selectedId]);
 
   // Reset this farm's layout + customization back to defaults (and clear server twins).
   const resetLayout = useCallback(() => {
@@ -3379,7 +4061,7 @@ export default function FarmTwinPage() {
           camera={{ position: [24, 20, 26], fov: 42, near: 0.5, far: 2000 }}
           onPointerMissed={() => select(null)}
         >
-          <Scene scene={scene} editMode={editMode} onSelect={select} onCommit={commitTwin} clock={clock} cinematic={cinematic} />
+          <Scene scene={scene} editMode={editMode} onSelect={select} onCommit={commitTwin} clock={clock} cinematic={cinematic} onValve={handleValve} />
         </Canvas>
 
         {/* edit-mode hint */}
@@ -3399,6 +4081,9 @@ export default function FarmTwinPage() {
         {features.weather && <WeatherPanel />}
         {digital && digitalLayer === 'comms' && <SpectrumPanel nodeIds={scene.nodeIds} />}
         {digital && digitalLayer === 'energy' && <EnergyHUD nodeIds={scene.nodeIds} />}
+        {digital && digitalLayer === 'sleep' && <SleepHUD nodeIds={scene.nodeIds} />}
+        {digital && digitalLayer === 'prediction' && <FuturePanel />}
+        {digital && digitalLayer === 'all' && <AllLayersPanel />}
         {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
         {showOta && <OtaPanel scene={scene} meta={metaRef.current} onClose={() => setShowOta(false)} toast={toast} />}
         {showSchedule && farmId && <SchedulePanel farmId={farmId} scene={scene} meta={metaRef.current} onClose={() => setShowSchedule(false)} toast={toast} />}
@@ -3407,7 +4092,7 @@ export default function FarmTwinPage() {
         {wxDemo && <WeatherDemoPanel farmId={farmId} onClose={() => setWxDemo(false)} />}
 
         {showCustomize && <CustomizePanel deviceId={selectedId} onSave={commitTwin} onClose={() => select(null)} />}
-        {!editMode && <DetailPanel key={selectedId} canControl={selMeta?.type === 'node'} onValve={setValve} onClose={() => select(null)} />}
+        {!editMode && !digital && <DetailPanel key={selectedId} canControl={selMeta?.type === 'node'} onValve={setValve} onClose={() => select(null)} />}
       </div>
     </div>
   );

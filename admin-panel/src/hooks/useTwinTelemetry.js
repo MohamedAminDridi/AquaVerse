@@ -9,12 +9,13 @@ export function useTwinTelemetry(farmId) {
   const apply = useTwinStore((s) => s.apply);
   const setWeather = useTwinStore((s) => s.setWeather);
   const recordPacket = useTwinStore((s) => s.recordPacket);
+  const firePacket = useTwinStore((s) => s.firePacket);
 
   const handlers = useMemo(() => ({
     // Live weather broadcast (Open-Meteo → backend → Socket.IO → 3D scene).
     // Skip while a manual demo override is active so it isn't overwritten.
     'weather:update': (w) => { if (!useTwinStore.getState().weatherLocked) setWeather(w); },
-    'sensor:data': (d) => { recordPacket(d.deviceId, d.seq); return apply(d.deviceId, {
+    'sensor:data': (d) => { recordPacket(d.deviceId, d.seq); firePacket(d.deviceId, -1); return apply(d.deviceId, {
       soil:   d.soil_moisture_pct,
       temp:   d.temperature_c,
       hum:    d.humidity_pct,
@@ -33,6 +34,12 @@ export function useTwinTelemetry(farmId) {
       ...(d.pump_state != null || d.pump != null
         ? { pump: d.pump_state ?? d.pump }
         : {}),
+      // Real duty-cycle timing from the node (LoRa). slpStamp marks when slpUp
+      // was measured so the countdown can extrapolate from the device clock.
+      ...(d.slp_on  != null ? { slpOn: d.slp_on, slpStamp: Date.now() } : {}),
+      ...(d.slp_awk != null ? { slpAwk: d.slp_awk } : {}),
+      ...(d.slp_nap != null ? { slpNap: d.slp_nap } : {}),
+      ...(d.slp_up  != null ? { slpUp:  d.slp_up  } : {}),
     }); },
     'node:status': (d) => apply(d.device_id ?? d.deviceId, {
       status: d.status,
@@ -49,7 +56,7 @@ export function useTwinTelemetry(farmId) {
     }),
     connect:    () => useTwinStore.getState().setLive(true),
     disconnect: () => useTwinStore.getState().setLive(false),
-  }), [apply, setWeather, recordPacket]);
+  }), [apply, setWeather, recordPacket, firePacket]);
 
   return useSocket(farmId, handlers);
 }

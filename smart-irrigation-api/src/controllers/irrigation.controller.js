@@ -2,11 +2,26 @@ const Node    = require('../models/Node.model');
 const Gateway = require('../models/Gateway.model');
 const Command = require('../models/Command.model');
 const { publish }  = require('../mqtt/mqttClient');
+const pendingCommands = require('../mqtt/pendingCommands');
 const topics       = require('../utils/mqttTopics');
 const { asyncHandler } = require('../utils/asyncHandler');
 const { success, created } = require('../utils/apiResponse');
 
 const clampPercent = (p) => Math.max(0, Math.min(100, Math.round(Number(p) || 0)));
+
+// Send a command now if the node was heard within its ~8 s listen window;
+// otherwise queue it for delivery on the node's next wake (telemetry). Returns
+// 'sent' or 'queued' so callers/UI can show the right state. Exported so the
+// sleep cron and sleep endpoints reuse the same reliable delivery.
+const LISTEN_WINDOW_MS = 9000;
+function deliver(node, message) {
+  const topic = topics.command(node.farm.toString(), node.device_id);
+  const heard = node.last_seen && (Date.now() - new Date(node.last_seen).getTime() < LISTEN_WINDOW_MS);
+  if (heard) { publish(topic, message); return 'sent'; }
+  pendingCommands.queue(node.device_id, topic, message);
+  return 'queued';
+}
+exports.deliverToNode = deliver;
 
 // ───────────────────────────────────────────────────────────────────────────
 // Shared-pump reconciler.
@@ -49,11 +64,15 @@ async function issueValve(req, res, type) {
     node: node._id, farm: node.farm, type, payload,
     issuedBy: req.user._id, source: 'manual',
   });
-  publish(topics.command(node.farm.toString(), node.device_id), {
+  // Opening a valve forces the node awake (it can't hold a servo while sleeping),
+  // so suspend its duty cycle. The firmware also clears sleep mode on valve_open.
+  if (type === 'valve_open' && node.sleep) { node.sleep.enabled = false; node.sleep.state = 'awake'; }
+
+  const delivery = deliver(node, {
     id: node.device_id,          // node firmware checks this to filter its own commands
     cmd_id: cmd._id.toString(), type, payload: cmd.payload, ts: Date.now(),
   });
-  cmd.status = 'sent';
+  cmd.status = delivery === 'sent' ? 'sent' : 'queued';
   await cmd.save();
 
   // Mirror the intended valve state so the reconciler can count it.
@@ -63,7 +82,10 @@ async function issueValve(req, res, type) {
   await node.save();
 
   const pump = await reconcileFarmPump(node.farm);
-  created(res, { command: cmd, pump }, `Command sent · pump ${pump.on ? 'running' : 'stopped'} (${pump.openValves} valve${pump.openValves === 1 ? '' : 's'} open)`);
+  const note = delivery === 'queued'
+    ? 'Queued — delivers on the node’s next wake'
+    : `Command sent · pump ${pump.on ? 'running' : 'stopped'} (${pump.openValves} valve${pump.openValves === 1 ? '' : 's'} open)`;
+  created(res, { command: cmd, pump, delivery }, note);
 }
 
 // Exported so the schedule cron can reuse the shared-pump reconciler.
@@ -92,6 +114,107 @@ async function manualPump(req, res, type) {
 
 exports.startPump = asyncHandler((req, res) => manualPump(req, res, 'pump_start'));
 exports.stopPump  = asyncHandler((req, res) => manualPump(req, res, 'pump_stop'));
+
+// ───────────────────────────────────────────────────────────────────────────
+// Deep-sleep duty cycle. The node has no RTC, so the backend owns the calendar:
+// it stores the per-node schedule and publishes timed sleep/wake commands (the
+// daily-window cron in jobs/index.js fires them at startTime / wakeTime). The
+// node just toggles its duty cycle on receipt. Commands carry an "id" so the
+// gateway forwards them over LoRa (pump-style broadcasts without "id" don't).
+// ───────────────────────────────────────────────────────────────────────────
+function publishSleepCmd(node, type, payload = {}) {
+  // Reliable: queues if the node is asleep, delivered on its next wake.
+  return deliver(node, { id: node.device_id, type, payload, ts: Date.now() });
+}
+
+// 24h band schedule helpers. A band's interval applies from its start time until
+// the next band's start (wrapping midnight). The node has no RTC, so the backend
+// resolves the active band each minute and pushes the matching interval.
+const hhmmToMin = (s) => { const [h, m] = String(s || '0:0').split(':').map(Number); return (h || 0) * 60 + (m || 0); };
+// Resolve the active band's { awakeMin, sleepMin } for a minute-of-day, or null.
+function currentBand(bands, mins) {
+  if (!bands || !bands.length) return null;
+  const parsed = bands.filter((b) => b && b.start)
+    .map((b) => ({ m: hhmmToMin(b.start), awakeMin: b.awakeMin, sleepMin: b.sleepMin })).sort((a, b) => a.m - b.m);
+  if (!parsed.length) return null;
+  let cur = parsed[parsed.length - 1];        // covers midnight wrap before the first band
+  for (const b of parsed) { if (b.m <= mins) cur = b; else break; }
+  return cur;
+}
+exports.currentBand = currentBand;
+exports.hhmmToMin = hhmmToMin;
+
+// GET the node's sleep config.
+exports.getSleep = asyncHandler(async (req, res) => {
+  const node = await Node.findById(req.params.nodeId).select('sleep device_id name');
+  if (!node) return res.status(404).json({ success: false, message: 'Node not found' });
+  success(res, { sleep: node.sleep || {} });
+});
+
+const clampMin = (v, d) => { const n = Number(v); return Number.isFinite(n) ? Math.max(0.05, Math.min(1440, n)) : d; };
+
+// PUT the node's sleep config (awake/sleep durations, optional bands, daily
+// window). Pass `enabled` to also activate/deactivate the duty cycle now.
+exports.setSleep = asyncHandler(async (req, res) => {
+  const node = await Node.findById(req.params.nodeId);
+  if (!node) return res.status(404).json({ success: false, message: 'Node not found' });
+  const b = req.body || {};
+  const s = node.sleep;
+  if (Array.isArray(b.bands)) {
+    s.bands = b.bands.filter((x) => x && x.start).map((x) => ({
+      start: String(x.start), awakeMin: clampMin(x.awakeMin, 1), sleepMin: clampMin(x.sleepMin, 15),
+    }));
+  }
+  if (b.awakeMin != null) s.awakeMin = clampMin(b.awakeMin, s.awakeMin);
+  if (b.sleepMin != null) s.sleepMin = clampMin(b.sleepMin, s.sleepMin);
+  if (b.daily    != null) s.daily    = !!b.daily;
+  if (b.startTime)        s.startTime = String(b.startTime);
+  if (b.wakeTime)         s.wakeTime  = String(b.wakeTime);
+
+  let delivery;
+  if (b.enabled != null) {
+    s.enabled = !!b.enabled;
+    s.state   = b.enabled ? 'sleeping' : 'awake';
+    if (b.enabled) {
+      const now  = new Date();
+      const band = currentBand(s.bands, now.getHours() * 60 + now.getMinutes());
+      const awake_min = band?.awakeMin ?? s.awakeMin ?? 1;
+      const sleep_min = band?.sleepMin ?? s.sleepMin ?? 15;
+      delivery = publishSleepCmd(node, 'sleep_now', { awake_min, sleep_min });
+    } else {
+      delivery = publishSleepCmd(node, 'wake', {});
+    }
+  }
+  node.markModified('sleep');
+  await node.save();
+  created(res, { sleep: node.sleep, delivery },
+    delivery === 'queued' ? 'Saved — applies on the node’s next wake' : 'Sleep config saved');
+});
+
+// Manual activate: turn the duty cycle on with the given awake/sleep durations.
+exports.sleepNow = asyncHandler(async (req, res) => {
+  const node = await Node.findById(req.params.nodeId);
+  if (!node) return res.status(404).json({ success: false, message: 'Node not found' });
+  const s = node.sleep;
+  if (req.body?.awakeMin != null) s.awakeMin = clampMin(req.body.awakeMin, s.awakeMin);
+  if (req.body?.sleepMin != null) s.sleepMin = clampMin(req.body.sleepMin, s.sleepMin);
+  s.enabled = true; s.state = 'sleeping';
+  node.markModified('sleep');
+  await node.save();
+  const delivery = publishSleepCmd(node, 'sleep_now', { awake_min: s.awakeMin, sleep_min: s.sleepMin });
+  created(res, { sleep: node.sleep, delivery }, `Sleep on · awake ${s.awakeMin}m / sleep ${s.sleepMin}m`);
+});
+
+// Manual deactivate: command the node back to normal continuous (awake) mode.
+exports.wakeNode = asyncHandler(async (req, res) => {
+  const node = await Node.findById(req.params.nodeId);
+  if (!node) return res.status(404).json({ success: false, message: 'Node not found' });
+  node.sleep.enabled = false; node.sleep.state = 'awake';
+  node.markModified('sleep');
+  await node.save();
+  const delivery = publishSleepCmd(node, 'wake', {});
+  created(res, { sleep: node.sleep, delivery }, 'Sleep off — node staying awake');
+});
 
 exports.getCommands = asyncHandler(async (req, res) => {
   const { page = 1, limit = 20, status } = req.query;
