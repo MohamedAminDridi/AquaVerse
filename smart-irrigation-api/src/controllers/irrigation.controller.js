@@ -64,9 +64,10 @@ async function issueValve(req, res, type) {
     node: node._id, farm: node.farm, type, payload,
     issuedBy: req.user._id, source: 'manual',
   });
-  // Opening a valve forces the node awake (it can't hold a servo while sleeping),
-  // so suspend its duty cycle. The firmware also clears sleep mode on valve_open.
-  if (type === 'valve_open' && node.sleep) { node.sleep.enabled = false; node.sleep.state = 'awake'; }
+  // Opening a valve keeps the node awake while it waters (a servo can't hold its
+  // position in deep sleep), but the duty cycle is only PAUSED, not cancelled —
+  // the firmware resumes sleep automatically once the valve closes. So we leave
+  // node.sleep.enabled untouched here to stay in sync with the device.
 
   const delivery = deliver(node, {
     id: node.device_id,          // node firmware checks this to filter its own commands

@@ -136,6 +136,11 @@ function plotTarget(out, status, customColor) {
   return out;
 }
 const statusColor = (s) => (s === 'online' ? '#22c55e' : s === 'offline' ? '#ef4444' : '#9ca3af');
+// Node state colour: SLEEP (blue) wins over offline so a duty-cycling node stays
+// blue between wakes; otherwise green online / red offline / grey unknown.
+const SLEEP_HEX = '#6366f1';
+const nodeStateColor = (status, sleeping) =>
+  sleeping ? SLEEP_HEX : status === 'offline' ? '#ef4444' : status === 'online' ? '#22c55e' : '#9ca3af';
 
 /* ---------------------------------------------------- day/night + crops */
 // Sky / sun / moonlight colours, blended by sun elevation (−1 night … +1 noon).
@@ -208,6 +213,7 @@ const NEON_BLUE = '#38e0ff';
 const NEON_CYAN = '#22d3ee';
 const SOLAR_YEL = '#ffd54a';
 const SLEEP_COL = new THREE.Color('#6366f1');   // indigo wash for sleeping node plots
+const AURA_COL  = new THREE.Color('#38bdf8');   // blue energy streams of the Power Aura
 
 // Radial-gradient sprite texture used to fake neon glow / bloom (built once).
 function makeGlowTexture() {
@@ -847,9 +853,24 @@ function AllLayerHud({ deviceId, onValve }) {
   const sleepSt  = sleepCycleState(sleepCfg, dev);
   const [asking, setAsking] = useState(false);
   const [pct, setPct]       = useState(100);
+  const [hidden, setHidden] = useState(false);
   const [, setTick]         = useState(0);
   // 1s ticker keeps the battery-time + sleep countdown live.
   useEffect(() => { const t = setInterval(() => setTick((n) => n + 1), 1000); return () => clearInterval(t); }, []);
+
+  // Collapsed → just a small chip floating above the lamp to bring the HUD back.
+  if (hidden) {
+    return (
+      <Html position={[0, 2.9, 0]} center distanceFactor={12} className="select-none" zIndexRange={[110, 0]}>
+        <button
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => { e.stopPropagation(); setHidden(false); }}
+          title="Show panel"
+          className="px-2 py-0.5 rounded-full bg-slate-900/85 text-white text-[11px] font-semibold ring-1 ring-white/15 shadow-lg hover:bg-slate-800"
+        >📊</button>
+      </Html>
+    );
+  }
 
   const status    = dev.status || 'unknown';
   const online    = status === 'online';
@@ -864,13 +885,15 @@ function AllLayerHud({ deviceId, onValve }) {
   const pumpOn    = (dev.pump ?? dev.pump_state) === 'on';
   const batV      = dev.bat_v ?? dev.battery_v;
   const timeTxt   = fmtMin(dev.time_min ?? dev.battery_time_min);
-  const sleeping  = sleepCfg?.state === 'sleeping' || sleepCfg?.enabled;
+  const sleeping  = isSleeping(dev, sleepCfg);
   const canControl = online || sleeping;          // sleeping → backend queues the command
   const v = (x, suf = '') => (x === null || x === undefined || x === '' ? '—' : `${x}${suf}`);
   const stop = (e) => e.stopPropagation();         // keep clicks off the canvas / orbit controls
 
   return (
-    <Html position={[0, 2.6, 0]} center distanceFactor={11} className="select-none" zIndexRange={[120, 0]}>
+    // Float well ABOVE the node lamp/orb (which sits at y≈1.68) so the card never
+    // covers the device itself.
+    <Html position={[0, 3.4, 0]} center distanceFactor={11} className="select-none" zIndexRange={[120, 0]}>
       <div
         onPointerDown={stop} onClick={stop} onWheel={stop}
         className="w-[212px] rounded-xl bg-slate-900/90 backdrop-blur-md shadow-2xl ring-1 ring-white/10 overflow-hidden text-white"
@@ -882,6 +905,8 @@ function AllLayerHud({ deviceId, onValve }) {
           {sleeping  && <span className="text-[10px]" title="sleeping">💤</span>}
           {valveOpen && <span className="text-[10px]" title="watering">🚿</span>}
           {pumpOn    && <span className="text-[10px]" title="pump on">⚙</span>}
+          <button onClick={() => setHidden(true)} title="Hide panel"
+            className="text-slate-400 hover:text-white text-base leading-none -mr-0.5 ml-0.5">×</button>
         </div>
 
         {/* every metric in one grid */}
@@ -898,14 +923,17 @@ function AllLayerHud({ deviceId, onValve }) {
           </span>
         </div>
 
-        {/* battery runtime + sleep countdown */}
-        {(timeTxt || sleepSt) && (
+        {/* battery runtime + sleep countdown + schedule-projected life */}
+        {(timeTxt || sleepSt || (sleeping && dutyBatteryMin(dev, sleepCfg))) && (
           <div className="px-2.5 pb-1.5 space-y-0.5 text-[10px] font-semibold">
             {timeTxt && (
               <div className={charging ? 'text-amber-300' : 'text-emerald-300'}>
                 {charging ? `⚡ ${timeTxt} to full` : `🔋 ${timeTxt} left`}
               </div>
             )}
+            {sleeping && (() => { const m = dutyBatteryMin(dev, sleepCfg); return m ? (
+              <div className="text-sky-300" title="Estimated life on the current sleep schedule">🔋⏱ {fmtMin(m)} on schedule</div>
+            ) : null; })()}
             {sleepSt && (
               <div className="text-indigo-300">{sleepSt.sleeping ? '💤' : '☀'} {sleepSt.label}</div>
             )}
@@ -952,6 +980,123 @@ function AllLayerHud({ deviceId, onValve }) {
   );
 }
 
+/* ---------------------------------------------------- sleep phase helper */
+// Is this node in deep-sleep duty-cycle right now? The node's reported flag wins:
+// if it explicitly says slpOn === false (e.g. a valve command forced it awake),
+// it is NOT sleeping even if the saved config still says enabled. Otherwise fall
+// back to the config. This one check drives every sleep visual + the countdown,
+// so they can never disagree (which was causing the valve-counter bounce).
+function isSleeping(d, cfg) {
+  if (d && d.slpOn === false) return false;          // node explicitly awake
+  return !!(d && d.slpOn) || !!(cfg && (cfg.enabled || cfg.state === 'sleeping'));
+}
+
+// Single source of truth for "how asleep is this node right now", reused by the
+// Power Aura and the LoRa-link dimmer. sleepiness ramps 0→1 across the awake
+// window (so it peaks just before deep sleep), then stays 1 while sleeping.
+function sleepPhase(d, cfg) {
+  const on = isSleeping(d, cfg);
+  if (!on) return { on: false, sleeping: false, sleepiness: 0 };
+  const awakeSec = (d && d.slpAwk) || (cfg && cfg.awakeMin ? cfg.awakeMin * 60 : 60);
+  let up = 0;
+  if (d && d.slpStamp) up = (d.slpUp || 0) + (Date.now() - d.slpStamp) / 1000;
+  const sleeping = up >= awakeSec;
+  const sleepiness = sleeping ? 1 : Math.min(1, up / Math.max(1, awakeSec));
+  return { on: true, sleeping, sleepiness };
+}
+
+// Projected battery life under the deep-sleep schedule. Deep sleep can't be
+// measured live, so we blend the measured AWAKE current with an assumed sleep
+// draw across the duty cycle:  avg = (Iawake·awake + Isleep·sleep)/(awake+sleep).
+// Returns minutes of runtime (to empty), or null if we lack the inputs. Must
+// match the firmware's DEEP_SLEEP_MA so UI and device agree.
+const DEEP_SLEEP_MA = 0.5;
+function dutyBatteryMin(dev, cfg) {
+  const mah    = dev?.bat_mah ?? dev?.battery_mah;
+  const iAwake = Math.abs(dev?.bat_ma ?? dev?.battery_ma ?? 0);
+  if (mah == null || mah <= 0 || !iAwake) return null;
+  const ph       = sleepPhase(dev, cfg);
+  const awakeSec = dev?.slpAwk || (cfg?.awakeMin ? cfg.awakeMin * 60 : 0);
+  const sleepSec = dev?.slpNap || (cfg?.sleepMin ? cfg.sleepMin * 60 : 0);
+  if (!ph.on || !awakeSec || !sleepSec) return (mah / iAwake) * 60;     // continuous draw
+  const avg = (iAwake * awakeSec + DEEP_SLEEP_MA * sleepSec) / (awakeSec + sleepSec);
+  return (mah / avg) * 60;
+}
+
+/* ------------------------------------------------------- Intelligent Power Aura */
+// Shown over a duty-cycling node in the energy / sleep / all layers. As the node
+// approaches deep sleep, blue energy streams spiral back INTO its central core
+// (conserving power) and a soft core glow pulses ever slower. While awake & fresh
+// it's nearly invisible; it intensifies as sleepiness → 1, then settles low while
+// the node is actually sleeping.
+const AURA_N = 30;
+function PowerAura({ deviceId, half }) {
+  const grpRef  = useRef();
+  const ptsRef  = useRef();
+  const coreRef = useRef();
+  const geo = useMemo(() => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(AURA_N * 3), 3));
+    return g;
+  }, []);
+  const seeds = useMemo(() => Array.from({ length: AURA_N }, () => ({
+    ang: Math.random() * Math.PI * 2,
+    r:   (half + 0.5) * (0.65 + Math.random() * 0.7),
+    y0:  0.5 + Math.random() * 1.7,
+    ph:  Math.random(),
+    sp:  0.5 + Math.random() * 0.7,
+  })), [half]);
+  const CORE_Y = 1.1;   // node "central core" the streams flow back into
+
+  useFrame(() => {
+    const S = useTwinStore.getState();
+    const d = S.byId[deviceId] || {};
+    const ph = sleepPhase(d, S.sleepCfg[deviceId]);
+    if (grpRef.current) grpRef.current.visible = ph.on;
+    if (!ph.on) return;
+    const k   = ph.sleepiness;            // 0 fresh-awake → 1 sleeping
+    const now = performance.now();
+
+    // blue streams converging into the core (faster + brighter as sleep nears)
+    if (ptsRef.current) {
+      const arr = geo.attributes.position.array;
+      for (let i = 0; i < AURA_N; i++) {
+        const s = seeds[i];
+        let u = (s.ph + now * 0.00012 * s.sp * (1 + k * 2.2)) % 1;   // loop progress
+        u = 1 - u;                                                   // outside → core
+        const rr  = s.r * u;
+        const ang = s.ang + now * 0.0004;
+        arr[i * 3]     = Math.cos(ang) * rr;
+        arr[i * 3 + 1] = CORE_Y + (s.y0 - CORE_Y) * u;              // funnel down to core
+        arr[i * 3 + 2] = Math.sin(ang) * rr;
+      }
+      geo.attributes.position.needsUpdate = true;
+      const m = ptsRef.current.material;
+      m.opacity = 0.12 + k * 0.7;
+      m.size    = 0.10 + k * 0.07;
+    }
+
+    // central core glow — slow "breathing" pulse that slows further as it sleeps
+    if (coreRef.current) {
+      const rate = 0.0022 * (1 - k * 0.7);     // ~3s awake → ~10s when asleep
+      const p = 0.7 + 0.3 * Math.sin(now * rate);
+      coreRef.current.scale.setScalar((0.9 + k * 0.9) * p);
+      coreRef.current.material.opacity = (0.18 + k * 0.5) * p;
+    }
+  });
+
+  return (
+    <group ref={grpRef} visible={false}>
+      <points ref={ptsRef} geometry={geo}>
+        <pointsMaterial color={AURA_COL} size={0.12} transparent opacity={0.25} depthWrite={false} sizeAttenuation blending={THREE.AdditiveBlending} />
+      </points>
+      <sprite ref={coreRef} position={[0, CORE_Y, 0]} scale={[1, 1, 1]}>
+        <spriteMaterial map={GLOW_TEX} color={AURA_COL} transparent opacity={0.25} depthWrite={false} blending={THREE.AdditiveBlending} />
+      </sprite>
+    </group>
+  );
+}
+
 /* -------------------------------------------------------------- node marker */
 // Each node is a big square field plot ("terrain"). Plot colour = status (or a
 // custom tint); a status-coloured border always shows online/offline at a
@@ -968,6 +1113,8 @@ function NodeMarker({ deviceId, gwColor, selected, editMode, onSelect, onBeginDr
   // The "All" (🌐) layer: one unified floating HUD per node replaces every other
   // per-node tag/label (which would otherwise stack on top of each other).
   const allLayer = useTwinStore((s) => s.digital && s.digitalLayer === 'all');
+  // Power Aura shows in the energy / sleep / all layers.
+  const auraLayer = useTwinStore((s) => s.digital && (s.digitalLayer === 'energy' || s.digitalLayer === 'sleep' || s.digitalLayer === 'all'));
   const sleepCfg = useTwinStore((s) => s.sleepCfg[deviceId]);
   const sleepSt = sleepCycleState(sleepCfg, dev);   // null when not in sleep mode
   const plotRef  = useRef();
@@ -1028,9 +1175,10 @@ function NodeMarker({ deviceId, gwColor, selected, editMode, onSelect, onBeginDr
     const pumpOn    = online && (d.pump ?? d.pump_state) === 'on';
     const watering  = valveOpen || pumpOn;   // only an online node sprays / flows
 
-    // sleeping nodes (deep-sleep duty cycle) tint the plot indigo
+    // sleeping nodes (deep-sleep duty cycle) tint the plot indigo. The node's own
+    // reported slp flag wins; the saved config is only a fallback.
     const scfg = S.sleepCfg[deviceId];
-    const napping = !!(scfg && (scfg.enabled || scfg.state === 'sleeping'));
+    const napping = isSleeping(d, scfg);
 
     // self-illuminate plots + soil disc at night so they don't go dark
     const nightLit = ENV.night * 0.6;
@@ -1084,21 +1232,25 @@ function NodeMarker({ deviceId, gwColor, selected, editMode, onSelect, onBeginDr
     }
     if (orbRef.current) {
       const low = (d.bat ?? d.battery_pct ?? 100) < LOW_BAT;
-      orbRef.current.material.emissiveIntensity = (low ? 0.4 + Math.abs(Math.sin(now * 0.006)) : 0.9) + ENV.night * 1.4;
+      // Sleeping nodes breathe slowly (~4s) instead of the normal steady/alert glow.
+      orbRef.current.material.emissiveIntensity = napping
+        ? 0.45 + 0.45 * Math.abs(Math.sin(now * 0.0016)) + ENV.night * 1.0
+        : (low ? 0.4 + Math.abs(Math.sin(now * 0.006)) : 0.9) + ENV.night * 1.4;
     }
     // neon LED glow — ramps up after dark (cyberpunk night mode)
     if (ledRef.current) {
       const online = status === 'online';
       const pulse = 0.75 + Math.sin(now * 0.005) * 0.25;
       ledRef.current.material.opacity = ENV.night * (online ? 0.95 : 0.22) * pulse;
-      ledRef.current.material.color.set(statusColor(status));
+      ledRef.current.material.color.set(napping ? SLEEP_HEX : statusColor(status));
       const sc = 0.7 + ENV.night * 0.6;
       ledRef.current.scale.set(sc, sc, sc);
     }
   });
 
-  const orbColor   = statusColor(dev.status);
-  const borderCol  = statusColor(dev.status);
+  const sleepingNow = isSleeping(dev, sleepCfg);
+  const orbColor   = nodeStateColor(dev.status, sleepingNow);
+  const borderCol  = nodeStateColor(dev.status, sleepingNow);
   const showSel    = selected || hovered;
   const cornerCol  = gwColor || '#94a3b8';
   const discR      = Math.min(0.85, half * 0.5);
@@ -1193,6 +1345,9 @@ function NodeMarker({ deviceId, gwColor, selected, editMode, onSelect, onBeginDr
       {/* off-grid solar power: panel + battery + animated energy flows */}
       {feat.energy && <NodeEnergy deviceId={deviceId} half={half} />}
 
+      {/* Intelligent Power Aura — blue streams returning to core before sleep */}
+      {auraLayer && <PowerAura deviceId={deviceId} half={half} />}
+
       {feat.labels && !tagLayer && !allLayer && (() => {
         // Rich "reality" label — one glance summarises every layer: status +
         // sleep/valve badges, then soil (water/biology), temp (climate),
@@ -1203,7 +1358,7 @@ function NodeMarker({ deviceId, gwColor, selected, editMode, onSelect, onBeginDr
         const temp = dev.temp;
         const rssi = dev.rssi ?? dev.lora_rssi;
         const valveOpen = (dev.valve ?? dev.valve_state) === 'open';
-        const sleepingNode = sleepCfg?.state === 'sleeping' || sleepCfg?.enabled;
+        const sleepingNode = isSleeping(dev, sleepCfg);
         const online = dev.status === 'online';
         return (
           <Html position={[0, 2.2, 0]} center distanceFactor={13} className="pointer-events-none select-none">
@@ -1459,9 +1614,24 @@ function GatewayObject({ deviceId, color, editMode, onSelect, onBeginDrag, clust
 function LoraLink({ fromKey, toKey, color }) {
   const a = useTwinStore((s) => s.positions[fromKey]);
   const b = useTwinStore((s) => s.positions[toKey]);
+  const ref = useRef();
+  // Power lines dim progressively as either end's node approaches deep sleep,
+  // then sit very faint while it's asleep (the link is effectively powered down).
+  useFrame((_, dt) => {
+    if (!ref.current) return;
+    const S = useTwinStore.getState();
+    const k = Math.max(
+      sleepPhase(S.byId[fromKey], S.sleepCfg[fromKey]).sleepiness,
+      sleepPhase(S.byId[toKey],   S.sleepCfg[toKey]).sleepiness,
+    );
+    const target = 0.5 - k * 0.42;     // 0.5 awake → ~0.08 asleep
+    const m = ref.current.material;
+    m.opacity = THREE.MathUtils.lerp(m.opacity, target, Math.min(1, dt * 3));
+  });
   if (!a || !b) return null;
   return (
     <Line
+      ref={ref}
       points={[[a[0], 0.4, a[2]], [b[0], 0.4, b[2]]]}
       color={color || '#22d3ee'}
       lineWidth={1.2}
@@ -2536,14 +2706,25 @@ function fmtDur(sec) {
 // that anchor, so the countdown matches the device and re-syncs every packet.
 // Falls back to a config-based estimate for older firmware that doesn't report.
 function sleepCycleState(cfg, dev) {
-  if (!cfg || !(cfg.enabled || cfg.state === 'sleeping')) return null;
+  // The node's own report (slpOn) is the source of truth. If it says it's awake
+  // (e.g. a valve command suspended sleep), show no countdown even if the saved
+  // config still says enabled — otherwise the fallback would bounce every packet.
+  if (dev && dev.slpOn === false) return null;
+  const reported = dev && dev.slpOn && dev.slpAwk != null && dev.slpStamp;
+  const cfgOn    = cfg && (cfg.enabled || cfg.state === 'sleeping');
+  if (!reported && !cfgOn) return null;
+  cfg = cfg || {};
 
-  if (dev && dev.slpOn && dev.slpAwk != null && dev.slpStamp) {
+  if (reported) {
     const awakeSec = dev.slpAwk;
     const sleepSec = dev.slpNap ?? ((cfg.sleepMin ?? 15) * 60);
     const since = (Date.now() - dev.slpStamp) / 1000;       // s since this report
     const up    = (dev.slpUp || 0) + since;                 // s awake this cycle now
-    if (up < awakeSec)            return { sleeping: false, remaining: awakeSec - up,            label: `sleeps in ${fmtDur(awakeSec - up)}` };
+    const valveOpen = (dev.valve ?? dev.valve_state) === 'open';
+    if (up < awakeSec)            return { sleeping: false, remaining: awakeSec - up, label: `sleeps in ${fmtDur(awakeSec - up)}` };
+    // Window elapsed but the valve is still open → the node holds awake (a servo
+    // can't run during deep sleep). Show watering instead of a wrong "wakes in".
+    if (valveOpen)                return { sleeping: false, remaining: 0, label: 'awake · watering 💧' };
     if (up < awakeSec + sleepSec) return { sleeping: true,  remaining: awakeSec + sleepSec - up, label: `wakes in ${fmtDur(awakeSec + sleepSec - up)}` };
     return { sleeping: true, remaining: 0, label: 'waking…' };
   }
@@ -2553,8 +2734,11 @@ function sleepCycleState(cfg, dev) {
   const band = bands.length ? activeBand(bands, nowMins) : null;
   const awakeSec = (band?.awakeMin ?? cfg.awakeMin ?? 1) * 60;
   const sleepSec = (band?.sleepMin ?? cfg.sleepMin ?? 15) * 60;
-  const wokeAt = dev?.wokeAt || dev?.lastUpdate;
-  if (!wokeAt) return { sleeping: true, remaining: sleepSec, label: `sleep ${fmtDur(sleepSec)}` };
+  // Only a genuine wake stamp anchors the fallback. Never fall back to lastUpdate
+  // (it refreshes every packet, which made the countdown bounce). With no anchor
+  // show a static label instead of a ticking — wrong — number.
+  const wokeAt = dev?.wokeAt;
+  if (!wokeAt) return { sleeping: true, remaining: 0, label: 'sleep mode' };
   const elapsed = (Date.now() - wokeAt) / 1000;
   if (elapsed < awakeSec) return { sleeping: false, remaining: awakeSec - elapsed, label: `sleeps in ${fmtDur(awakeSec - elapsed)}` };
   if (elapsed < awakeSec + sleepSec) return { sleeping: true, remaining: awakeSec + sleepSec - elapsed, label: `wakes in ${fmtDur(awakeSec + sleepSec - elapsed)}` };
@@ -2629,7 +2813,12 @@ function SleepControl({ nodeId, online, deviceId }) {
   const bands = Array.isArray(c.bands) ? c.bands : [];
   const set = (patch) => setCfg({ ...c, ...patch });
   const flash = (m) => { setMsg(m); setTimeout(() => setMsg(''), 2500); };
-  const sleeping = c.state === 'sleeping' || c.enabled;
+  // Reflect the node's REAL reported state (slp flag), not just the saved DB
+  // config — after a reflash the node boots awake while the DB may still say
+  // enabled, which otherwise leaves the toggle stuck ON with the node not asleep.
+  const sleeping = isSleeping(dev, c);
+  const cfgEnabled = c.state === 'sleeping' || c.enabled;   // what the DB/config intends
+  const outOfSync = cfgEnabled && dev && dev.slpOn === false; // node awake but config says sleep
   const nowMins = (() => { const d = new Date(); return d.getHours() * 60 + d.getMinutes(); })();
   const band = bands.length ? activeBand(bands, nowMins) : null;
   const awakeMin = band?.awakeMin ?? c.awakeMin ?? 1;
@@ -2693,7 +2882,12 @@ function SleepControl({ nodeId, online, deviceId }) {
           <button onClick={addBand} className="text-[11px] text-indigo-600 hover:underline">+ add band</button>
         </div>
 
-        <button onClick={() => save(null)} disabled={busy} className="w-full text-[12px] font-semibold py-1.5 rounded-lg bg-slate-700 text-white hover:bg-slate-800 disabled:opacity-40 mt-1">Save schedule</button>
+        {/* Save schedule re-applies to the node when sleep is on (pushes new
+            durations/bands as a fresh sleep_now); otherwise just stores config. */}
+        <button onClick={() => save((sleeping || cfgEnabled) ? true : null)} disabled={busy} className="w-full text-[12px] font-semibold py-1.5 rounded-lg bg-slate-700 text-white hover:bg-slate-800 disabled:opacity-40 mt-1">Save schedule</button>
+        {outOfSync && (
+          <p className="text-[10px] text-amber-600 mt-1.5 font-semibold">⚠ Node is awake but sleep is enabled — tap the toggle (or Save schedule) to re-activate it.</p>
+        )}
         {sleeping
           ? <p className="text-[10px] text-slate-400 mt-1.5">Commands queue &amp; deliver on the next wake. Timer drifts ±10%.</p>
           : (!online && <p className="text-[10px] text-slate-400 mt-1.5">Node must be online to activate sleep.</p>)}
@@ -2782,6 +2976,13 @@ function DetailPanel({ canControl, onValve, onClose }) {
           )}
         </div>
       )}
+
+      {/* projected life under the deep-sleep schedule (sleeping nodes) */}
+      {sel.slpOn && (() => { const m = dutyBatteryMin(sel, null); return m ? (
+        <div className="px-3 -mt-1 pb-2 text-[11px] font-semibold text-sky-600" title="Blends measured awake current with the assumed deep-sleep draw across the duty cycle">
+          🔋⏱ ≈ {fmtMin(m)} on this sleep schedule
+        </div>
+      ) : null; })()}
 
       {/* 24h trend sparklines */}
       {hist && hist.length > 1 && (
@@ -3822,7 +4023,7 @@ export default function FarmTwinPage() {
 
         const links = buildChainLinks(nodes, nodeGw, gwColor);
 
-        seed([...nodes, ...gws]);
+        seed([...nodes, ...gws], id);
         setPositions(positions);
         setCustomMap(custom);
         // seed each node's sleep config so the reality 💤 + countdown work
@@ -4092,7 +4293,11 @@ export default function FarmTwinPage() {
         {wxDemo && <WeatherDemoPanel farmId={farmId} onClose={() => setWxDemo(false)} />}
 
         {showCustomize && <CustomizePanel deviceId={selectedId} onSave={commitTwin} onClose={() => select(null)} />}
-        {!editMode && !digital && <DetailPanel key={selectedId} canControl={selMeta?.type === 'node'} onValve={setValve} onClose={() => select(null)} />}
+        {/* Click-to-open detail HUD (with its × to hide) is available in EVERY layer
+            except the 🌐 All layer, where the floating per-node HUD already serves. */}
+        {!editMode && !(digital && digitalLayer === 'all') && (
+          <DetailPanel key={selectedId} canControl={selMeta?.type === 'node'} onValve={setValve} onClose={() => select(null)} />
+        )}
       </div>
     </div>
   );

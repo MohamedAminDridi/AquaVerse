@@ -164,7 +164,14 @@ float readBatteryPct() {
 // real charge in/out — it does NOT drift up just because the voltage rose under
 // charge. Seeded from the voltage estimate at boot, and slowly re-synced to it
 // while the pack is at rest (current ~0) to cancel long-term integration drift.
-float    g_batMah   = -1.0f;          // mAh remaining (-1 until seeded)
+// Assumed average board draw during DEEP SLEEP (ESP32 + radio off, INA219/DHT
+// idle). The INA219 can't measure while the chip is powered down, so we charge
+// the fuel gauge this fixed amount per sleep second on wake. Tune to your board:
+// a bare ESP32 deep-sleeps at ~0.01 mA, but modules/regulators push it higher.
+#define DEEP_SLEEP_MA 0.5f
+// RTC_DATA_ATTR so the coulomb count SURVIVES deep sleep (plain globals reset on
+// every timer wake, which would lose all sleep-cycle accounting).
+RTC_DATA_ATTR float g_batMah = -1.0f; // mAh remaining (-1 until seeded)
 uint32_t g_lastCoul = 0;
 
 void updateCoulomb() {
@@ -332,7 +339,9 @@ void handleCommand(const char* type, JsonVariant payload) {
   }
 
   if (strcmp(type, "valve_open") == 0) {
-    g_sleepMode = false;   // a node can't hold a valve open while deep-sleeping → stay awake
+    // Keep the duty cycle ENABLED. The loop simply won't deep-sleep while the
+    // valve is open (a servo can't hold position when powered down); sleep
+    // auto-resumes once the valve closes. Opening no longer cancels the schedule.
     int pct = 100;
     if (!payload.isNull()) pct = payload["percent"] | 100;
     setValvePercent(constrain(pct, 1, 100));
@@ -347,6 +356,8 @@ void handleCommand(const char* type, JsonVariant payload) {
     delay(300);            // give servo time to reach 0°
     setValvePercent(0);    // update state variable + write 0° again to confirm
     setPumpState(false);
+    // NOTE: do NOT touch g_wakeMillis here — the awake window stays anchored to
+    // when the node woke, so sending a command never restarts the "sleeps in" countdown.
     sendStatus();
 
   } else if (strcmp(type, "pump_start") == 0) {
@@ -410,7 +421,7 @@ void sendAlive() {
   JsonDocument doc;
   doc["type"]        = "alive";
   doc["id"]          = DEVICE_ID;
-  doc["fw"]          = "2.0.0";
+  doc["fw"]          = "2.1.0";
   doc["bat"]         = batterySoC();
   doc["bat_v"]       = round(readBatteryVoltage() * 100) / 100.0;
   doc["bat_ma"]      = round(readBatteryCurrent_mA() * 10) / 10.0;
@@ -478,12 +489,19 @@ void setup() {
   // Keep duty-cycling only across genuine deep-sleep wakes; any real restart
   // (power-on, EN/reset, re-flash, brownout) starts awake with sleep disabled.
   if (esp_reset_reason() == ESP_RST_DEEPSLEEP) {
-    Serial.printf("[SLEEP] woke from deep sleep (awake=%us sleep=%us wake#%u)\n",
-                  g_awakeSec, g_wakeIntervalSec, g_bootCount);
+    // Charge the fuel gauge for the energy spent while asleep (unmeasurable live).
+    if (g_batMah > 0) {
+      g_batMah -= DEEP_SLEEP_MA * (g_wakeIntervalSec / 3600.0f);
+      if (g_batMah < 0) g_batMah = 0;
+    }
+    Serial.printf("[SLEEP] woke from deep sleep (awake=%us sleep=%us wake#%u) batt=%dmAh\n",
+                  g_awakeSec, g_wakeIntervalSec, g_bootCount, (int)g_batMah);
   } else {
     g_sleepMode = false;
     Serial.println("[BOOT] fresh start — deep sleep disabled");
   }
+  Serial.printf("[BOOT] fw 2.1.0 (sleep-pause build) — sleepMode=%d awake=%us sleep=%us\n",
+                g_sleepMode, g_awakeSec, g_wakeIntervalSec);
   Serial.println("[BOOT] Listening for commands...");
 }
 
@@ -512,8 +530,16 @@ void loop() {
   }
 
   // Deep-sleep duty cycle: stay awake g_awakeSec each cycle (reporting + taking
-  // commands), then deep-sleep g_wakeIntervalSec. A valve_open forces awake.
-  if (g_sleepMode && !otaActive && (now - g_wakeMillis >= g_awakeSec * 1000UL)) {
+  // commands), then deep-sleep g_wakeIntervalSec. The awake window is anchored to
+  // g_wakeMillis (set ONCE at wake in setup) and is never reset by a command, so
+  // the "sleeps in …" countdown keeps ticking smoothly even when you open/close
+  // the valve. While a valve is open the node simply won't deep-sleep (a servo
+  // can't hold position when powered down); once it elapses + the valve is closed
+  // it sleeps. (underflow guard keeps the elapsed sane if millis ever wraps.)
+  uint32_t awakeMs = (now >= g_wakeMillis) ? (now - g_wakeMillis) : 0;
+  if (g_sleepMode && !otaActive && valvePercent == 0 && awakeMs >= g_awakeSec * 1000UL) {
+    Serial.printf("[SLEEP] awake window done: %us / %us → sleeping %us\n",
+                  awakeMs / 1000, g_awakeSec, g_wakeIntervalSec);
     enterDeepSleep();
   }
 

@@ -1,12 +1,43 @@
 import { create } from 'zustand';
 
+// ── Live-state persistence ───────────────────────────────────────────────────
+// The store is in-memory, so a refresh (or leaving and returning) loses the last
+// telemetry — a problem for sleeping nodes, which only report on wake and would
+// otherwise show blank for an entire sleep window. We mirror the live fields per
+// farm to localStorage (debounced) and re-hydrate on seed. The sleep countdown is
+// anchored to an absolute timestamp (slpStamp), so restoring it lets the countdown
+// resume exactly where it was — no conflict, no reset.
+const LIVE_KEY = (farmId) => `twin_live_${farmId}`;
+const LIVE_FIELDS = [
+  'soil', 'temp', 'hum', 'bat', 'bat_v', 'bat_ma', 'bat_mah', 'time_min',
+  'charging', 'valve', 'valve_pct', 'pump', 'rssi', 'status', 'lastUpdate', 'wokeAt',
+  'slpOn', 'slpAwk', 'slpNap', 'slpUp', 'slpStamp',
+];
+let _saveTimer = null;
+function persistLive(get) {
+  if (_saveTimer) return;                          // debounce a burst of telemetry
+  _saveTimer = setTimeout(() => {
+    _saveTimer = null;
+    const { farmId, byId } = get();
+    if (!farmId) return;
+    const slim = {};
+    for (const [id, d] of Object.entries(byId)) {
+      const o = {};
+      for (const k of LIVE_FIELDS) if (d[k] !== undefined) o[k] = d[k];
+      slim[id] = o;
+    }
+    try { localStorage.setItem(LIVE_KEY(farmId), JSON.stringify(slim)); } catch { /* quota */ }
+  }, 1500);
+}
+
 // Holds the live state of every device in the currently-viewed farm, keyed by
 // device_id. Telemetry patches land here (NOT in React state) so the 3D Canvas
 // can read values via useFrame without re-rendering the whole component tree.
 //
 // `positions` is kept here too so a single dragged marker (and its link) can
 // re-render in isolation while the rest of the scene stays still.
-export const useTwinStore = create((set) => ({
+export const useTwinStore = create((set, get) => ({
+  farmId: null,      // farm currently seeded (used to key persisted live state)
   byId: {},          // { [device_id]: { ...device, soil, temp, hum, bat, status, valve, pump, zone, lastUpdate } }
   positions: {},     // { [device_id]: [x, 0, z] }  ground-plane layout
   custom: {},        // { [device_id]: { size, rot, color, label } }  per-plot customization
@@ -57,11 +88,21 @@ export const useTwinStore = create((set) => ({
   // playback (24h replay) — frames: [{ ts, byId: { [deviceId]: { soil, temp, hum, bat } } }]
   playback: { active: false, playing: false, idx: 0, frames: [], from: null, interval: 'hour' },
 
-  // Replace the whole device map (called once per farm load).
-  seed: (devices) => set(() => {
+  // Replace the whole device map (called once per farm load). Re-hydrates the
+  // last-known live telemetry saved before a refresh/leave so sleeping nodes show
+  // their last data immediately and the countdown resumes mid-cycle.
+  seed: (devices, farmId = null) => set(() => {
     const byId = {};
     devices.forEach((d) => { byId[d.device_id] = d; });
-    return { byId, selectedId: null };
+    if (farmId) {
+      try {
+        const saved = JSON.parse(localStorage.getItem(LIVE_KEY(farmId)) || '{}');
+        for (const [id, live] of Object.entries(saved)) {
+          if (byId[id]) byId[id] = { ...byId[id], ...live };
+        }
+      } catch { /* ignore corrupt cache */ }
+    }
+    return { byId, selectedId: null, farmId };
   }),
 
   // Optimistic valve update for instant button feedback. The node's real
@@ -70,6 +111,7 @@ export const useTwinStore = create((set) => ({
   commandValve: (deviceId, open, pct) => set((s) => {
     const prev = s.byId[deviceId];
     if (!prev) return {};
+    persistLive(get);
     return { byId: { ...s.byId, [deviceId]: { ...prev, valve: open ? 'open' : 'closed', valve_pct: open ? pct : 0, lastUpdate: Date.now() } } };
   }),
 
@@ -83,6 +125,7 @@ export const useTwinStore = create((set) => ({
     // sleep / sleep→wake countdown for the duty cycle.
     const isReport = patch.soil !== undefined || patch.temp !== undefined || patch.bat !== undefined;
     const wokeAt = (isReport && prev.lastUpdate && now - prev.lastUpdate > 20000) ? now : prev.wokeAt;
+    persistLive(get);     // debounced mirror to localStorage (survives refresh)
     return { byId: { ...s.byId, [deviceId]: { ...prev, ...patch, wokeAt, lastUpdate: now } } };
   }),
 
