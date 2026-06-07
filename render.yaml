@@ -1,0 +1,33 @@
+# AquaVerse backend — Render blueprint (always-on Node for MQTT + Socket.IO + cron).
+# Render → New → Blueprint → point at this repo. Then fill the `sync: false` secrets
+# in the dashboard. NOTE: the FREE plan sleeps after 15 min idle, which drops the
+# MQTT connection — use the Starter plan (or Railway/Fly) for a 24/7 IoT backend.
+services:
+  - type: web
+    name: aquaverse-api
+    runtime: node
+    plan: free                 # change to "starter" for always-on
+    rootDir: smart-irrigation-api
+    buildCommand: npm install
+    startCommand: node src/server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGO_URI            # MongoDB Atlas SRV string
+        sync: false
+      - key: MQTT_BROKER_URL      # e.g. mqtts://xxx.hivemq.cloud:8883
+        sync: false
+      - key: MQTT_USERNAME
+        sync: false
+      - key: MQTT_PASSWORD
+        sync: false
+      - key: MQTT_CLIENT_ID
+        value: aquaverse-backend
+      - key: JWT_SECRET
+        generateValue: true       # Render generates a strong secret
+      - key: JWT_ACCESS_EXPIRES
+        value: 15m
+      - key: JWT_REFRESH_EXPIRES
+        value: 7d
+      - key: CORS_ORIGIN          # http://localhost:5173,https://aquaverse.netlify.app
+        sync: false

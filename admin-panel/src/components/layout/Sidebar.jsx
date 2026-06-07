@@ -2,7 +2,7 @@ import { NavLink }       from 'react-router-dom';
 import { useAlertStore } from '../../store/alertStore';
 
 const links = [
-  { to: '/twin',       label: '3D Twin',      icon: '🌐'  },
+  { to: '/twin',       label: 'AquaVerse',    icon: '🌊'  },
   { to: '/dashboard',  label: 'Dashboard',    icon: '▦'  },
   { to: '/farms',      label: 'Farms',        icon: '🗺'  },
   { to: '/gateways',   label: 'Gateways',     icon: '📡'  },
@@ -21,7 +21,7 @@ export default function Sidebar() {
   return (
     <aside className="w-56 bg-white border-r border-gray-200 flex flex-col">
       <div className="px-5 py-4 border-b border-gray-200">
-        <span className="text-green-700 font-semibold text-sm tracking-wide">💧 IrriAdmin</span>
+        <span className="text-green-700 font-semibold text-sm tracking-wide">🌊 AquaVerse</span>
       </div>
       <nav className="flex-1 py-3 space-y-0.5 px-2">
         {links.map(l => (

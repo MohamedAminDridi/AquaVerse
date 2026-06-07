@@ -213,7 +213,6 @@ const NEON_BLUE = '#38e0ff';
 const NEON_CYAN = '#22d3ee';
 const SOLAR_YEL = '#ffd54a';
 const SLEEP_COL = new THREE.Color('#6366f1');   // indigo wash for sleeping node plots
-const AURA_COL  = new THREE.Color('#38bdf8');   // blue energy streams of the Power Aura
 
 // Radial-gradient sprite texture used to fake neon glow / bloom (built once).
 function makeGlowTexture() {
@@ -1023,80 +1022,6 @@ function dutyBatteryMin(dev, cfg) {
   return (mah / avg) * 60;
 }
 
-/* ------------------------------------------------------- Intelligent Power Aura */
-// Shown over a duty-cycling node in the energy / sleep / all layers. As the node
-// approaches deep sleep, blue energy streams spiral back INTO its central core
-// (conserving power) and a soft core glow pulses ever slower. While awake & fresh
-// it's nearly invisible; it intensifies as sleepiness → 1, then settles low while
-// the node is actually sleeping.
-const AURA_N = 30;
-function PowerAura({ deviceId, half }) {
-  const grpRef  = useRef();
-  const ptsRef  = useRef();
-  const coreRef = useRef();
-  const geo = useMemo(() => {
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(AURA_N * 3), 3));
-    return g;
-  }, []);
-  const seeds = useMemo(() => Array.from({ length: AURA_N }, () => ({
-    ang: Math.random() * Math.PI * 2,
-    r:   (half + 0.5) * (0.65 + Math.random() * 0.7),
-    y0:  0.5 + Math.random() * 1.7,
-    ph:  Math.random(),
-    sp:  0.5 + Math.random() * 0.7,
-  })), [half]);
-  const CORE_Y = 1.1;   // node "central core" the streams flow back into
-
-  useFrame(() => {
-    const S = useTwinStore.getState();
-    const d = S.byId[deviceId] || {};
-    const ph = sleepPhase(d, S.sleepCfg[deviceId]);
-    if (grpRef.current) grpRef.current.visible = ph.on;
-    if (!ph.on) return;
-    const k   = ph.sleepiness;            // 0 fresh-awake → 1 sleeping
-    const now = performance.now();
-
-    // blue streams converging into the core (faster + brighter as sleep nears)
-    if (ptsRef.current) {
-      const arr = geo.attributes.position.array;
-      for (let i = 0; i < AURA_N; i++) {
-        const s = seeds[i];
-        let u = (s.ph + now * 0.00012 * s.sp * (1 + k * 2.2)) % 1;   // loop progress
-        u = 1 - u;                                                   // outside → core
-        const rr  = s.r * u;
-        const ang = s.ang + now * 0.0004;
-        arr[i * 3]     = Math.cos(ang) * rr;
-        arr[i * 3 + 1] = CORE_Y + (s.y0 - CORE_Y) * u;              // funnel down to core
-        arr[i * 3 + 2] = Math.sin(ang) * rr;
-      }
-      geo.attributes.position.needsUpdate = true;
-      const m = ptsRef.current.material;
-      m.opacity = 0.12 + k * 0.7;
-      m.size    = 0.10 + k * 0.07;
-    }
-
-    // central core glow — slow "breathing" pulse that slows further as it sleeps
-    if (coreRef.current) {
-      const rate = 0.0022 * (1 - k * 0.7);     // ~3s awake → ~10s when asleep
-      const p = 0.7 + 0.3 * Math.sin(now * rate);
-      coreRef.current.scale.setScalar((0.9 + k * 0.9) * p);
-      coreRef.current.material.opacity = (0.18 + k * 0.5) * p;
-    }
-  });
-
-  return (
-    <group ref={grpRef} visible={false}>
-      <points ref={ptsRef} geometry={geo}>
-        <pointsMaterial color={AURA_COL} size={0.12} transparent opacity={0.25} depthWrite={false} sizeAttenuation blending={THREE.AdditiveBlending} />
-      </points>
-      <sprite ref={coreRef} position={[0, CORE_Y, 0]} scale={[1, 1, 1]}>
-        <spriteMaterial map={GLOW_TEX} color={AURA_COL} transparent opacity={0.25} depthWrite={false} blending={THREE.AdditiveBlending} />
-      </sprite>
-    </group>
-  );
-}
-
 /* -------------------------------------------------------------- node marker */
 // Each node is a big square field plot ("terrain"). Plot colour = status (or a
 // custom tint); a status-coloured border always shows online/offline at a
@@ -1113,8 +1038,6 @@ function NodeMarker({ deviceId, gwColor, selected, editMode, onSelect, onBeginDr
   // The "All" (🌐) layer: one unified floating HUD per node replaces every other
   // per-node tag/label (which would otherwise stack on top of each other).
   const allLayer = useTwinStore((s) => s.digital && s.digitalLayer === 'all');
-  // Power Aura shows in the energy / sleep / all layers.
-  const auraLayer = useTwinStore((s) => s.digital && (s.digitalLayer === 'energy' || s.digitalLayer === 'sleep' || s.digitalLayer === 'all'));
   const sleepCfg = useTwinStore((s) => s.sleepCfg[deviceId]);
   const sleepSt = sleepCycleState(sleepCfg, dev);   // null when not in sleep mode
   const plotRef  = useRef();
@@ -1344,9 +1267,6 @@ function NodeMarker({ deviceId, gwColor, selected, editMode, onSelect, onBeginDr
 
       {/* off-grid solar power: panel + battery + animated energy flows */}
       {feat.energy && <NodeEnergy deviceId={deviceId} half={half} />}
-
-      {/* Intelligent Power Aura — blue streams returning to core before sleep */}
-      {auraLayer && <PowerAura deviceId={deviceId} half={half} />}
 
       {feat.labels && !tagLayer && !allLayer && (() => {
         // Rich "reality" label — one glance summarises every layer: status +
@@ -4168,10 +4088,10 @@ export default function FarmTwinPage() {
         <div className="px-4 py-3 flex items-center gap-3 flex-wrap">
           {/* identity */}
           <div className="flex items-center gap-3 min-w-0">
-            <div className="grid place-items-center h-10 w-10 rounded-xl bg-emerald-500/15 ring-1 ring-emerald-400/30 text-xl shrink-0">🌾</div>
+            <div className="grid place-items-center h-10 w-10 rounded-xl bg-cyan-500/15 ring-1 ring-cyan-400/30 text-xl shrink-0">🌊</div>
             <div className="min-w-0">
-              <h1 className="text-[15px] font-bold text-white tracking-tight leading-none">3D Digital Twin</h1>
-              <p className="text-[11px] text-slate-400 mt-1 truncate">Field plots relay in a chain back to their gateway · click any plot to control it</p>
+              <h1 className="text-[15px] font-bold text-white tracking-tight leading-none">AquaVerse</h1>
+              <p className="text-[11px] text-slate-400 mt-1 truncate">Your farm, mirrored as a living 3D world · click any plot to control it</p>
             </div>
           </div>
 
