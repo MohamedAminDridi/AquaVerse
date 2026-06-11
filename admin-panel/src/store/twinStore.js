@@ -8,9 +8,12 @@ import { create } from 'zustand';
 // anchored to an absolute timestamp (slpStamp), so restoring it lets the countdown
 // resume exactly where it was — no conflict, no reset.
 const LIVE_KEY = (farmId) => `twin_live_${farmId}`;
+// NOTE: `status` is intentionally NOT persisted — online/offline must always
+// come from the backend (its sweep marks silent devices offline), otherwise a
+// cached 'online' would survive a refresh with the hardware powered off.
 const LIVE_FIELDS = [
   'soil', 'temp', 'hum', 'bat', 'bat_v', 'bat_ma', 'bat_mah', 'time_min',
-  'charging', 'valve', 'valve_pct', 'pump', 'rssi', 'status', 'lastUpdate', 'wokeAt',
+  'charging', 'valve', 'valve_pct', 'pump', 'rssi', 'lastUpdate', 'wokeAt',
   'slpOn', 'slpAwk', 'slpNap', 'slpUp', 'slpStamp',
 ];
 let _saveTimer = null;
@@ -98,7 +101,19 @@ export const useTwinStore = create((set, get) => ({
       try {
         const saved = JSON.parse(localStorage.getItem(LIVE_KEY(farmId)) || '{}');
         for (const [id, live] of Object.entries(saved)) {
-          if (byId[id]) byId[id] = { ...byId[id], ...live };
+          if (!byId[id]) continue;
+          // NEVER restore `status` from cache — the backend's offline sweep is
+          // authoritative. Restoring a stale 'online' made dead devices look
+          // alive after a refresh with everything powered off.
+          const { status: _drop, ...rest } = live;
+          // Drop a stale sleep anchor (older than ~2 full duty cycles): without
+          // fresh packets the countdown would resurrect from outdated data.
+          const cycleSec = (rest.slpAwk || 60) + (rest.slpNap || 900);
+          if (rest.slpStamp && Date.now() - rest.slpStamp > cycleSec * 2 * 1000) {
+            delete rest.slpOn; delete rest.slpAwk; delete rest.slpNap;
+            delete rest.slpUp; delete rest.slpStamp;
+          }
+          byId[id] = { ...byId[id], ...rest };
         }
       } catch { /* ignore corrupt cache */ }
     }

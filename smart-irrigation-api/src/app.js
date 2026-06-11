@@ -12,7 +12,14 @@ const corsOrigins = process.env.CORS_ORIGIN
   ? process.env.CORS_ORIGIN.split(',').map(o => o.trim())
   : '*';
 app.use(cors({ origin: corsOrigins, credentials: true }));
-app.use(morgan(process.env.NODE_ENV === 'development' ? 'dev' : 'combined'));
+// Request logging: verbose in dev; in production only FAILED requests (4xx/5xx)
+// are logged, and the 10-min keep-alive /api/health pings never are — keeps the
+// Render log stream down to what actually matters.
+app.use(morgan(process.env.NODE_ENV === 'development' ? 'dev' : 'combined', {
+  skip: (req, res) =>
+    req.originalUrl === '/api/health' ||
+    (process.env.NODE_ENV !== 'development' && res.statusCode < 400),
+}));
 app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true }));
 

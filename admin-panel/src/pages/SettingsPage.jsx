@@ -1,4 +1,81 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
+import api from '../services/api';
+
+// Live MQTT broker control — local broker is always on; the cloud broker can be
+// switched on/off here without redeploying. Persisted server-side.
+function BrokerSection() {
+  const [broker, setBroker] = useState(null);
+  const [busy, setBusy]     = useState(false);
+  const [err, setErr]       = useState('');
+
+  const load = () => api.get('/system/broker')
+    .then((r) => { setBroker(r.data?.data?.broker || null); setErr(''); })
+    .catch((e) => setErr(e.response?.data?.message || e.message));
+
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 5000);  // keep the connection dots fresh
+    return () => clearInterval(t);
+  }, []);
+
+  const toggleCloud = (on) => {
+    setBusy(true);
+    api.put('/system/broker', { cloud: on })
+      .then((r) => setBroker(r.data?.data?.broker || null))
+      .catch((e) => setErr(e.response?.data?.message || e.message))
+      .finally(() => setBusy(false));
+  };
+
+  const Dot = ({ ok }) => (
+    <span className={`inline-block w-2 h-2 rounded-full ${ok ? 'bg-emerald-500' : 'bg-rose-400'}`} />
+  );
+
+  const cloud = broker?.cloud;
+  return (
+    <section className="bg-white border border-gray-200 rounded-xl p-5 space-y-4">
+      <h2 className="text-sm font-semibold text-gray-700">MQTT Broker</h2>
+      {err && <p className="text-xs text-rose-600 bg-rose-50 px-3 py-1.5 rounded-lg">{err}</p>}
+
+      {/* Local broker (always on) */}
+      <div className="flex items-center justify-between rounded-lg bg-gray-50 border border-gray-100 px-3 py-2.5">
+        <div className="min-w-0">
+          <div className="text-sm font-medium text-gray-800 flex items-center gap-2">
+            <Dot ok={broker?.local?.connected} /> Local broker
+          </div>
+          <div className="text-[11px] text-gray-400 font-mono truncate">{broker?.local?.url || '—'}</div>
+        </div>
+        <span className="text-[11px] font-semibold text-gray-400 uppercase">always on</span>
+      </div>
+
+      {/* Cloud broker (toggle) */}
+      <div className="flex items-center justify-between rounded-lg bg-gray-50 border border-gray-100 px-3 py-2.5">
+        <div className="min-w-0">
+          <div className="text-sm font-medium text-gray-800 flex items-center gap-2">
+            <Dot ok={cloud?.connected} /> ☁️ Cloud broker
+          </div>
+          <div className="text-[11px] text-gray-400 font-mono truncate">
+            {cloud?.configured ? (cloud.url || 'configured') : 'not configured — set MQTT_CLOUD_URL on the server'}
+          </div>
+        </div>
+        <button
+          onClick={() => toggleCloud(!cloud?.enabled)}
+          disabled={busy || !cloud?.configured}
+          title={!cloud?.configured ? 'Set MQTT_CLOUD_URL in the backend env first' : ''}
+          className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors disabled:opacity-40 ${
+            cloud?.enabled ? 'bg-cyan-500' : 'bg-gray-300'}`}
+        >
+          <span className={`inline-block h-4 w-4 rounded-full bg-white transform transition-transform ${
+            cloud?.enabled ? 'translate-x-6' : 'translate-x-1'}`} />
+        </button>
+      </div>
+      <p className="text-[11px] text-gray-400">
+        Cloud broker is {cloud?.enabled ? 'ON' : 'OFF'}
+        {cloud?.enabled && !cloud?.connected ? ' · connecting…' : ''}.
+        The gateway must point at this broker for real data to flow.
+      </p>
+    </section>
+  );
+}
 
 export default function SettingsPage() {
   const [saved,setSaved]=useState(false);
@@ -17,6 +94,7 @@ export default function SettingsPage() {
     <div className="space-y-6 max-w-2xl">
       <h1 className="text-xl font-semibold text-gray-900">Settings</h1>
       {saved && <p className="text-sm text-green-700 bg-green-50 px-4 py-2 rounded-lg">Saved (wire to backend to persist)</p>}
+      <BrokerSection />
       <section className="bg-white border border-gray-200 rounded-xl p-5 space-y-4">
         <h2 className="text-sm font-semibold text-gray-700">System</h2>
         <Field label="JWT expiry"    k="jwt_expires" />

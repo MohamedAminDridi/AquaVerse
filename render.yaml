@@ -1,7 +1,14 @@
 # AquaVerse backend — Render blueprint (always-on Node for MQTT + Socket.IO + cron).
-# Render → New → Blueprint → point at this repo. Then fill the `sync: false` secrets
-# in the dashboard. NOTE: the FREE plan sleeps after 15 min idle, which drops the
-# MQTT connection — use the Starter plan (or Railway/Fly) for a 24/7 IoT backend.
+# Render → New → Blueprint → point at this repo, then fill the `sync: false`
+# secrets in the dashboard.
+#
+# NOTE on brokers: in the cloud there IS no "local" Mosquitto, so the primary
+# MQTT_BROKER_URL points straight at HiveMQ Cloud. Leave the MQTT_CLOUD_* vars
+# EMPTY here — if both slots pointed at the same broker, every packet would be
+# handled twice (duplicate sensor readings).
+#
+# NOTE on plan: the FREE plan sleeps after 15 min idle, which drops MQTT and
+# cron — fine for demos, but use "starter" for a 24/7 irrigation system.
 services:
   - type: web
     name: aquaverse-api
@@ -13,11 +20,11 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      - key: MONGO_URI            # MongoDB Atlas SRV string
+      - key: MONGO_URI            # Atlas URI incl. /smart_irrigation db name
         sync: false
-      - key: MQTT_BROKER_URL      # e.g. mqtts://xxx.hivemq.cloud:8883
+      - key: MQTT_BROKER_URL      # mqtts://<cluster>.hivemq.cloud:8883
         sync: false
-      - key: MQTT_USERNAME
+      - key: MQTT_USERNAME        # HiveMQ Access Management user
         sync: false
       - key: MQTT_PASSWORD
         sync: false
@@ -29,5 +36,5 @@ services:
         value: 15m
       - key: JWT_REFRESH_EXPIRES
         value: 7d
-      - key: CORS_ORIGIN          # http://localhost:5173,https://aquaverse.netlify.app
+      - key: CORS_ORIGIN          # http://localhost:5173,https://<site>.netlify.app
         sync: false

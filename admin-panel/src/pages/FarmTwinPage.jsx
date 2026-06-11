@@ -879,9 +879,9 @@ function AllLayerHud({ deviceId, onValve }) {
   const temp      = dev.temp;
   const hum       = dev.hum;
   const rssi      = dev.rssi ?? dev.lora_rssi;
-  const valveOpen = (dev.valve ?? dev.valve_state) === 'open';
+  const valveOpen = online && (dev.valve ?? dev.valve_state) === 'open';
   const valvePct  = dev.valve_pct;
-  const pumpOn    = (dev.pump ?? dev.pump_state) === 'on';
+  const pumpOn    = online && (dev.pump ?? dev.pump_state) === 'on';   // offline ⇒ never show pump on
   const batV      = dev.bat_v ?? dev.battery_v;
   const timeTxt   = fmtMin(dev.time_min ?? dev.battery_time_min);
   const sleeping  = isSleeping(dev, sleepCfg);
@@ -1277,9 +1277,9 @@ function NodeMarker({ deviceId, gwColor, selected, editMode, onSelect, onBeginDr
         const soil = dev.soil ?? dev.soil_moisture_pct;
         const temp = dev.temp;
         const rssi = dev.rssi ?? dev.lora_rssi;
-        const valveOpen = (dev.valve ?? dev.valve_state) === 'open';
-        const sleepingNode = isSleeping(dev, sleepCfg);
         const online = dev.status === 'online';
+        const valveOpen = online && (dev.valve ?? dev.valve_state) === 'open';
+        const sleepingNode = isSleeping(dev, sleepCfg);
         return (
           <Html position={[0, 2.2, 0]} center distanceFactor={13} className="pointer-events-none select-none">
             <div className="rounded-lg bg-white/92 backdrop-blur-sm shadow-lg border border-gray-200/80 overflow-hidden whitespace-nowrap">
@@ -1321,9 +1321,11 @@ function NodeMarker({ deviceId, gwColor, selected, editMode, onSelect, onBeginDr
 /* ---- live pump badge (React component so it can subscribe to the store) ---- */
 function PumpStatusBadge({ clusterNodeIds }) {
   const byId = useTwinStore((s) => s.byId);
+  // Only an ONLINE node can vouch for a running pump — a stale pump_state from
+  // an offline device must not show the pump as on.
   const on = clusterNodeIds.some((nid) => {
     const d = byId[nid];
-    return (d?.pump ?? d?.pump_state) === 'on';
+    return d?.status === 'online' && (d?.pump ?? d?.pump_state) === 'on';
   });
   return (
     <div style={{
@@ -1367,11 +1369,12 @@ function GatewayObject({ deviceId, color, editMode, onSelect, onBeginDrag, clust
         ringRef.current.material.opacity = 0.5 * (1 - t);
       }
     }
-    // ── pump — on when ANY cluster node has pump running ──────────
+    // ── pump — on when ANY ONLINE cluster node has pump running ───
+    // (stale pump_state from an offline device must not spin the pump)
     const byId = useTwinStore.getState().byId;
     const pumpOn = clusterNodeIds.some((nid) => {
       const d = byId[nid];
-      return (d?.pump ?? d?.pump_state) === 'on';
+      return d?.status === 'online' && (d?.pump ?? d?.pump_state) === 'on';
     });
     const now = performance.now();
     if (impRef.current) {
@@ -2844,9 +2847,10 @@ function DetailPanel({ canControl, onValve, onClose }) {
   }, [nodeId]);
   if (!sel) return null;
   const status    = sel.status || 'unknown';
-  const valveOpen = (sel.valve ?? sel.valve_state) === 'open';
+  // Offline devices can't vouch for a live valve/pump — show them off.
+  const valveOpen = status === 'online' && (sel.valve ?? sel.valve_state) === 'open';
   const valvePct  = sel.valve_pct;
-  const pumpOn    = (sel.pump ?? sel.pump_state) === 'on';
+  const pumpOn    = status === 'online' && (sel.pump ?? sel.pump_state) === 'on';
   const dot = status === 'online' ? 'bg-emerald-500' : status === 'offline' ? 'bg-rose-500' : 'bg-slate-400';
   const pill = status === 'online'
     ? 'bg-emerald-50 text-emerald-700 ring-emerald-200'

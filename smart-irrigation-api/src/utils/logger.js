@@ -5,7 +5,9 @@ const fmt = printf(({ level, message, timestamp, stack }) =>
         : `${timestamp} [${level}]: ${message}`);
 
 module.exports = createLogger({
-  level:  process.env.NODE_ENV === 'production' ? 'warn' : 'debug',
+  // production shows info+ (boot confirmations, broker connects, commands) but
+  // NOT debug (per-packet telemetry/heartbeat chatter). Override with LOG_LEVEL.
+  level:  process.env.LOG_LEVEL || (process.env.NODE_ENV === 'production' ? 'info' : 'debug'),
   silent: process.env.NODE_ENV === 'test',
   format: combine(errors({ stack:true }), timestamp({ format:'HH:mm:ss' }), fmt),
   transports: [

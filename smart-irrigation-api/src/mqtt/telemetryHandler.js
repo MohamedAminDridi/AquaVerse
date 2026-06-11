@@ -130,7 +130,8 @@ module.exports = async function handleTelemetry(farmId, nodeDeviceId, payload) {
       });
     }
 
-    logger.info(`📊 [${nodeDeviceId}] soil=${soil}% temp=${temp}°C hum=${hum}% bat=${bat}% rssi=${rssi} valve=${valveState ?? '?'} pump=${pumpState ?? '?'}`);
+    // debug: fires every report (~5 s/node) — hidden in production logs
+    logger.debug(`📊 [${nodeDeviceId}] soil=${soil}% temp=${temp}°C hum=${hum}% bat=${bat}% rssi=${rssi} valve=${valveState ?? '?'} pump=${pumpState ?? '?'}`);
 
     // ── Battery low alert (< 30%) — 30-minute cooldown ───────────────
     if (bat !== null && bat < 30) {

@@ -237,7 +237,8 @@ async function handleGatewayHeartbeat(farmId, deviceId, payload) {
     pkts_ok:   payload.pkts_ok ?? null,
     ts:        new Date(),
   });
-  logger.info(`💓 GW [${deviceId}] ip=${ip} uptime=${uptime_s}s rssi=${rssi}`);
+  // debug: fires every heartbeat (~3 s/gateway) — hidden in production logs
+  logger.debug(`💓 GW [${deviceId}] ip=${ip} uptime=${uptime_s}s rssi=${rssi}`);
 }
 
 module.exports = { initMQTT, publish, isConnected, setCloudEnabled, brokerStatus };
