@@ -19,7 +19,10 @@ async function offlineAlertExists(query) {
 exports.startJobs = () => {
 
   // ── Every minute: mark gateways + nodes offline if silent too long ──
-  cron.schedule('* * * * *', async () => {
+  // Also runs once ~5 s after boot, so the UI shows the truth immediately when
+  // the backend starts with the hardware powered off (instead of stale 'online'
+  // lingering until the first cron tick).
+  const sweepOffline = async () => {
     const now = Date.now();
 
     // ── Gateways: offline if no heartbeat in 15 s ─────────────────────
@@ -54,8 +57,10 @@ exports.startJobs = () => {
     }
 
     // ── Nodes: offline if no last_seen in 30 s ────────────────────────
-    // Skip nodes in deep-sleep mode — they're silent between wakes by design,
-    // so marking them offline would spam false alerts.
+    // Deep-sleeping nodes are silent between wakes by design, so they get a
+    // DYNAMIC cutoff instead of being skipped: 1.5× their full duty cycle
+    // (+60 s margin). A sleeper that misses ~2 wakes is genuinely gone —
+    // before this they stayed "online" forever even when powered off.
     const nodeCutoff = new Date(now - 30 * 1000);
     const offlineNodes = await Node.find({
       last_seen: { $lt: nodeCutoff },
@@ -63,8 +68,21 @@ exports.startJobs = () => {
       'sleep.enabled': { $ne: true },
     }).select('_id device_id farm');
 
+    const sleepers = await Node.find({
+      status: 'online',
+      'sleep.enabled': true,
+    }).select('_id device_id farm last_seen sleep');
+    for (const s of sleepers) {
+      const cycleMs = ((s.sleep?.awakeMin || 1) + (s.sleep?.sleepMin || 15)) * 60 * 1000;
+      const cutoff  = now - (cycleMs * 1.5 + 60 * 1000);
+      if (!s.last_seen || s.last_seen.getTime() < cutoff) offlineNodes.push(s);
+    }
+
     for (const node of offlineNodes) {
-      await Node.findByIdAndUpdate(node._id, { status: 'offline' });
+      // Clear pump_state too — an offline node can't vouch for a running pump,
+      // and a stale 'on' would keep the UI (and the shared-pump reconciler)
+      // believing the pump is still running.
+      await Node.findByIdAndUpdate(node._id, { status: 'offline', pump_state: 'off' });
       logger.warn(`Node offline: ${node.device_id}`);
 
       const exists = await offlineAlertExists({ farm: node.farm, node: node._id });
@@ -86,7 +104,9 @@ exports.startJobs = () => {
         ts:        new Date(),
       });
     }
-  });
+  };
+  cron.schedule('* * * * *', sweepOffline);
+  setTimeout(() => sweepOffline().catch((e) => logger.warn(`Boot sweep failed: ${e.message}`)), 5000);
 
   // ── Irrigation schedules: open/close valves at their window each minute ──
   cron.schedule('* * * * *', async () => {
@@ -180,6 +200,20 @@ exports.startJobs = () => {
   setTimeout(() => {
     weather.refreshAllFarms().catch((e) => logger.warn(`Weather warm-up failed: ${e.message}`));
   }, 5000);
+
+  // ── Keep-alive self-ping (Render free tier sleeps after 15 min idle) ──
+  // Every 10 min, GET our own public /api/health so the host sees inbound
+  // traffic before the 15-min idle cutoff. Render sets RENDER_EXTERNAL_URL
+  // automatically; KEEPALIVE_URL overrides it (or enables this elsewhere).
+  // Does nothing when neither is set (local dev).
+  const keepAliveBase = process.env.KEEPALIVE_URL || process.env.RENDER_EXTERNAL_URL;
+  if (keepAliveBase) {
+    const url = `${keepAliveBase.replace(/\/$/, '')}/api/health`;
+    cron.schedule('*/10 * * * *', () => {
+      fetch(url).catch((e) => logger.warn(`Keep-alive ping failed: ${e.message}`));
+    });
+    logger.info(`Keep-alive ping armed → ${url} (every 10 min)`);
+  }
 
   // ── Daily summary log ──────────────────────────────────────────────
   cron.schedule('0 0 * * *', () => {

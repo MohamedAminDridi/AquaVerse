@@ -16,6 +16,13 @@ app.use(morgan(process.env.NODE_ENV === 'development' ? 'dev' : 'combined'));
 app.use(express.json({ limit: '5mb' }));
 app.use(express.urlencoded({ extended: true }));
 
+// Public health/keep-alive ping — mounted BEFORE the rate limiter so the
+// 1-minute keep-alive (jobs/index.js) and uptime monitors never eat into the
+// API quota. Cheap: no DB hit, no auth.
+app.get('/api/health', (req, res) => res.json({
+  ok: true, uptime_s: Math.round(process.uptime()), ts: new Date(),
+}));
+
 app.use('/api', rateLimit({
   windowMs: 15 * 60 * 1000, max: 500,
   message: { success: false, message: 'Too many requests' },
@@ -24,6 +31,7 @@ app.use('/api', rateLimit({
 // Auth & Admin
 app.use('/api/auth',         require('./routes/auth.routes'));
 app.use('/api/admin',        require('./routes/admin.routes'));
+app.use('/api/system',       require('./routes/system.routes'));
 
 // Farms (flat)
 app.use('/api/farms',        require('./routes/farm.routes'));
