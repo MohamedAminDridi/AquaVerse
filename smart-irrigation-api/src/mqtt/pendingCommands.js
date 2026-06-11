@@ -6,24 +6,49 @@
 // needs no time-prediction (the deep-sleep timer drifts ±10%).
 const q = new Map();   // device_id -> [{ topic, message, ts }]
 
-// Queue a command. A newer command of the same `type` supersedes an older one
-// (no point opening a valve twice), so the node always gets the latest intent.
+// Commands within a family are mutually exclusive intents: a new one VOIDS any
+// queued sibling, not just the same type. Without this, a stale valve_close
+// queued while the node slept would flush right after a fresh valve_open and
+// slam the valve shut again ("opens then instantly closes").
+const FAMILIES = [
+  ['valve_open', 'valve_close', 'valve_toggle'],
+  ['sleep_now', 'sleep_config', 'wake', 'sleep_off'],
+];
+const familyOf = (type) => FAMILIES.find((f) => f.includes(type)) || (type ? [type] : []);
+
+// Queued commands older than this are stale intent — never deliver them.
+const TTL_MS = 15 * 60 * 1000;
+
+// Drop every queued command in `type`'s family. Called by deliver() BEFORE any
+// send-or-queue, so the newest intent always wins regardless of path.
+exports.clearFamily = (deviceId, type) => {
+  if (!deviceId || !type) return;
+  const list = q.get(deviceId);
+  if (!list) return;
+  const fam = familyOf(type);
+  const kept = list.filter((c) => !fam.includes(c.message?.type));
+  if (kept.length) q.set(deviceId, kept); else q.delete(deviceId);
+};
+
+// Queue a command, superseding anything in the same family.
 exports.queue = (deviceId, topic, message) => {
   if (!deviceId) return;
+  exports.clearFamily(deviceId, message?.type);
   const list = q.get(deviceId) || [];
-  const type = message && message.type;
-  const kept = type ? list.filter((c) => c.message?.type !== type) : list;
-  kept.push({ topic, message, ts: Date.now() });
-  q.set(deviceId, kept.slice(-10));
+  list.push({ topic, message, ts: Date.now() });
+  q.set(deviceId, list.slice(-10));
 };
 
 // Publish + clear everything queued for this node. Call on its telemetry/wake.
+// Silently drops entries past the TTL (a 2-hour-old "close" must not fire now).
 exports.flush = (deviceId, publish) => {
   const list = q.get(deviceId);
   if (!list || !list.length) return 0;
   q.delete(deviceId);
-  for (const c of list) publish(c.topic, c.message);
-  return list.length;
+  const now = Date.now();
+  const fresh = list.filter((c) => now - c.ts < TTL_MS);
+  for (const c of fresh) publish(c.topic, c.message);
+  return fresh.length;
 };
 
 // What's waiting (for the UI's "queued" indicator).

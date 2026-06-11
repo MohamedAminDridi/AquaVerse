@@ -16,6 +16,10 @@ const clampPercent = (p) => Math.max(0, Math.min(100, Math.round(Number(p) || 0)
 const LISTEN_WINDOW_MS = 9000;
 function deliver(node, message) {
   const topic = topics.command(node.farm.toString(), node.device_id);
+  // Newest intent wins: void any queued sibling command (e.g. a stale
+  // valve_close queued while the node slept must not fire after this
+  // valve_open is delivered — it would slam the valve shut instantly).
+  pendingCommands.clearFamily(node.device_id, message.type);
   const heard = node.last_seen && (Date.now() - new Date(node.last_seen).getTime() < LISTEN_WINDOW_MS);
   if (heard) { publish(topic, message); return 'sent'; }
   pendingCommands.queue(node.device_id, topic, message);
