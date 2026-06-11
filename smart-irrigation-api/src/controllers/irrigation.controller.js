@@ -38,14 +38,21 @@ exports.deliverToNode = deliver;
 // target state to verify against).
 const RETRY_GAP_MS  = 1800;
 const RETRY_MAX     = 4;
+// One retry loop per device: a NEWER valve command must cancel the older loop,
+// otherwise a stale "open" retry could re-open the valve right after the user
+// clicked close (observed when clicks were spammed during a laggy link).
+const retryTokens = new Map();   // device_id -> token of the active loop
 function retryValveUntilEcho(node, type, message) {
   if (type !== 'valve_open' && type !== 'valve_close') return;
   const want    = type === 'valve_open' ? 'open' : 'closed';
   const topic   = topics.command(node.farm.toString(), node.device_id);
   const startTs = Date.now();
+  const token   = startTs + Math.random();           // unique per loop
+  retryTokens.set(node.device_id, token);            // supersede any older loop
   let attempts  = 0;
 
   const tick = () => {
+    if (retryTokens.get(node.device_id) !== token) return;   // superseded by a newer click
     const echo = pendingCommands.lastValve(node.device_id);
     if (echo && echo.state === want && echo.ts >= startTs) return;   // confirmed ✓
     if (attempts >= RETRY_MAX) {
