@@ -232,12 +232,24 @@ void sendPacket(JsonDocument& doc) {
 
 // ── Actuator control ─────────────────────────────────────────────
 // Servo: 100% → 90°  (fully open), 0% → 0° (fully closed)
+// SOFT-START: ramp the horn in 2° steps instead of slamming to the target. A
+// full-speed jump draws a current spike big enough to brown-out the ESP32
+// (observed: node reboots ~1 s after valve_open, closing the valve again).
+// Ramping cuts the inrush sharply. Pair with the real fix: feed the servo from
+// the LM2596's 5 V directly + a 470–1000 µF cap across its supply.
+int g_servoAngle = 0;   // last commanded angle (servo is driven to 0° at boot)
 void setValvePercent(int pct) {
   pct = constrain(pct, 0, 100);
   valvePercent = pct;
-  int angle = map(pct, 0, 100, 0, 90);
-  valveServo.write(angle);
-  Serial.printf("[VALVE] %d%% → %d°\n", pct, angle);
+  int target = map(pct, 0, 100, 0, 90);
+  int step   = (target >= g_servoAngle) ? 2 : -2;
+  for (int a = g_servoAngle; (step > 0) ? (a <= target) : (a >= target); a += step) {
+    valveServo.write(a);
+    delay(15);                       // ~90° in ~0.7 s — gentle on the rail
+  }
+  valveServo.write(target);
+  g_servoAngle = target;
+  Serial.printf("[VALVE] %d%% → %d°\n", pct, target);
 }
 
 // Pump state is purely logical on this node (no relay).
@@ -352,9 +364,7 @@ void handleCommand(const char* type, JsonVariant payload) {
     sendStatus();
 
   } else if (strcmp(type, "valve_close") == 0) {
-    valveServo.write(0);   // force servo to 0° immediately
-    delay(300);            // give servo time to reach 0°
-    setValvePercent(0);    // update state variable + write 0° again to confirm
+    setValvePercent(0);    // ramps gently to 0° (soft-start, no brown-out)
     setPumpState(false);
     // NOTE: do NOT touch g_wakeMillis here — the awake window stays anchored to
     // when the node woke, so sending a command never restarts the "sleeps in" countdown.

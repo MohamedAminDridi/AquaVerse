@@ -50,6 +50,9 @@ module.exports = async function handleTelemetry(farmId, nodeDeviceId, payload) {
     const valvePct   = payload.vp ?? payload.valve_pct ?? null;
     let   valveState = payload.valve_state ?? payload.valve ?? null;
     if (valveState == null && valvePct != null) valveState = valvePct > 0 ? 'open' : 'closed';
+    // Record the node's REAL valve state so the command retry loop can confirm
+    // delivery (LoRa downlink is lossy; the backend re-sends until echoed).
+    if (valveState != null) pendingCommands.noteValve(node.device_id, valveState);
     let   pumpState  = payload.pump_state ?? payload.pump ?? null;
     if (pumpState == null && payload.p != null) pumpState = payload.p ? 'on' : 'off';
 

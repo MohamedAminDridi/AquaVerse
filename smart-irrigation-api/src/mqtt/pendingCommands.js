@@ -54,3 +54,14 @@ exports.flush = (deviceId, publish) => {
 // What's waiting (for the UI's "queued" indicator).
 exports.pending = (deviceId) => (q.get(deviceId) || []).map((c) => ({ type: c.message?.type, ts: c.ts }));
 exports.count   = (deviceId) => (q.get(deviceId) || []).length;
+
+// ── Real valve state echoes ──────────────────────────────────────────────────
+// The node echoes a telemetry packet right after executing a command, carrying
+// its REAL valve state. telemetryHandler records it here so the valve-command
+// retry loop can tell "node confirmed" apart from "command lost over LoRa"
+// (the DB can't be used for this — issueValve mirrors the INTENT there).
+const lastValve = new Map();   // device_id -> { state: 'open'|'closed', ts }
+exports.noteValve = (deviceId, state) => {
+  if (deviceId && state) lastValve.set(deviceId, { state, ts: Date.now() });
+};
+exports.lastValve = (deviceId) => lastValve.get(deviceId);

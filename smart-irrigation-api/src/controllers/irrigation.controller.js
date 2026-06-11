@@ -6,6 +6,7 @@ const pendingCommands = require('../mqtt/pendingCommands');
 const topics       = require('../utils/mqttTopics');
 const { asyncHandler } = require('../utils/asyncHandler');
 const { success, created } = require('../utils/apiResponse');
+const logger = require('../utils/logger');
 
 const clampPercent = (p) => Math.max(0, Math.min(100, Math.round(Number(p) || 0)));
 
@@ -26,6 +27,38 @@ function deliver(node, message) {
   return 'queued';
 }
 exports.deliverToNode = deliver;
+
+// ── Valve command ACK + retry ────────────────────────────────────────────────
+// LoRa downlink is half-duplex and lossy (the node can't hear while it's
+// transmitting, and local EMI can deafen its receiver) — a single send may need
+// several attempts. The node echoes its REAL valve state in telemetry right
+// after executing, so: wait ~1.8 s for that echo; if it doesn't match the
+// intent, re-publish. Up to 4 extra attempts, then give up (the UI's telemetry
+// view shows the truth either way). Toggle commands are skipped (no known
+// target state to verify against).
+const RETRY_GAP_MS  = 1800;
+const RETRY_MAX     = 4;
+function retryValveUntilEcho(node, type, message) {
+  if (type !== 'valve_open' && type !== 'valve_close') return;
+  const want    = type === 'valve_open' ? 'open' : 'closed';
+  const topic   = topics.command(node.farm.toString(), node.device_id);
+  const startTs = Date.now();
+  let attempts  = 0;
+
+  const tick = () => {
+    const echo = pendingCommands.lastValve(node.device_id);
+    if (echo && echo.state === want && echo.ts >= startTs) return;   // confirmed ✓
+    if (attempts >= RETRY_MAX) {
+      logger.warn(`Valve ${type} to ${node.device_id}: no echo after ${attempts + 1} sends — giving up`);
+      return;
+    }
+    attempts++;
+    publish(topic, { ...message, ts: Date.now(), retry: attempts });
+    logger.info(`🔁 Valve ${type} → ${node.device_id} retry #${attempts} (no echo yet)`);
+    setTimeout(tick, RETRY_GAP_MS);
+  };
+  setTimeout(tick, RETRY_GAP_MS);
+}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Shared-pump reconciler.
@@ -73,12 +106,15 @@ async function issueValve(req, res, type) {
   // the firmware resumes sleep automatically once the valve closes. So we leave
   // node.sleep.enabled untouched here to stay in sync with the device.
 
-  const delivery = deliver(node, {
+  const message = {
     id: node.device_id,          // node firmware checks this to filter its own commands
     cmd_id: cmd._id.toString(), type, payload: cmd.payload, ts: Date.now(),
-  });
+  };
+  const delivery = deliver(node, message);
   cmd.status = delivery === 'sent' ? 'sent' : 'queued';
   await cmd.save();
+  // Re-send until the node's telemetry echoes the new valve state (LoRa is lossy).
+  if (delivery === 'sent') retryValveUntilEcho(node, type, message);
 
   // Mirror the intended valve state so the reconciler can count it.
   if (type === 'valve_toggle')      node.valve_state = node.valve_state === 'open' ? 'closed' : 'open';
