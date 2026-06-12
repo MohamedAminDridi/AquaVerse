@@ -7,23 +7,12 @@ const { initSocket }    = require('./socket/socketServer');
 const { startJobs }     = require('./jobs');
 const logger            = require('./utils/logger');
 
-// Redis is optional — warn if unavailable but don't crash
-async function tryConnectRedis() {
-  try {
-    const { connectRedis } = require('./config/redis');
-    await connectRedis();
-  } catch (e) {
-    logger.warn('Redis not available — caching disabled:', e.message);
-  }
-}
-
 const PORT   = process.env.PORT || 5000;
 const server = http.createServer(app);
 
 (async () => {
   try {
     await connectMongo();   // MongoDB (primary + time-series)
-    await tryConnectRedis();// Redis (optional cache)
     initMQTT();
     initSocket(server);
     startJobs();

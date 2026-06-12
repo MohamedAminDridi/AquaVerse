@@ -136,6 +136,11 @@ function plotTarget(out, status, customColor) {
   return out;
 }
 const statusColor = (s) => (s === 'online' ? '#22c55e' : s === 'offline' ? '#ef4444' : '#9ca3af');
+// "Effectively alive" for DISPLAY of valve/pump state: online, or heard within
+// the last 60 s. A brief offline blip (a burst of lost LoRa packets trips the
+// 30 s sweep) must not flap the valve button closed→open→closed; a device
+// silent for over a minute genuinely shows everything off.
+const liveOn = (d) => !!d && (d.status === 'online' || (d.lastUpdate && Date.now() - d.lastUpdate < 60000));
 // Node state colour: SLEEP (blue) wins over offline so a duty-cycling node stays
 // blue between wakes; otherwise green online / red offline / grey unknown.
 const SLEEP_HEX = '#6366f1';
@@ -880,13 +885,14 @@ function AllLayerHud({ deviceId, onValve }) {
   const temp      = dev.temp;
   const hum       = dev.hum;
   const rssi      = dev.rssi ?? dev.lora_rssi;
-  const valveOpen = online && (dev.valve ?? dev.valve_state) === 'open';
+  const fresh     = liveOn(dev);   // 60 s grace — a status blip must not flap the button
+  const valveOpen = fresh && (dev.valve ?? dev.valve_state) === 'open';
   const valvePct  = dev.valve_pct;
-  const pumpOn    = online && (dev.pump ?? dev.pump_state) === 'on';   // offline ⇒ never show pump on
+  const pumpOn    = fresh && (dev.pump ?? dev.pump_state) === 'on';    // long-offline ⇒ shown off
   const batV      = dev.bat_v ?? dev.battery_v;
   const timeTxt   = fmtMin(dev.time_min ?? dev.battery_time_min);
   const sleeping  = isSleeping(dev, sleepCfg);
-  const canControl = online || sleeping;          // sleeping → backend queues the command
+  const canControl = fresh || sleeping;           // sleeping → backend queues the command
   const v = (x, suf = '') => (x === null || x === undefined || x === '' ? '—' : `${x}${suf}`);
   const stop = (e) => e.stopPropagation();         // keep clicks off the canvas / orbit controls
 
@@ -1100,9 +1106,10 @@ function NodeMarker({ deviceId, gwColor, selected, editMode, onSelect, onBeginDr
     const now = performance.now();
     const status    = d.status;
     const online    = status === 'online';
-    const valveOpen = online && (d.valve ?? d.valve_state) === 'open';
-    const pumpOn    = online && (d.pump ?? d.pump_state) === 'on';
-    const watering  = valveOpen || pumpOn;   // only an online node sprays / flows
+    const fresh     = liveOn(d);             // 60 s grace — blips don't stop the spray
+    const valveOpen = fresh && (d.valve ?? d.valve_state) === 'open';
+    const pumpOn    = fresh && (d.pump ?? d.pump_state) === 'on';
+    const watering  = valveOpen || pumpOn;   // only a recently-heard node sprays / flows
 
     // sleeping nodes (deep-sleep duty cycle) tint the plot indigo. The node's own
     // reported slp flag wins; the saved config is only a fallback.
@@ -1284,7 +1291,7 @@ function NodeMarker({ deviceId, gwColor, selected, editMode, onSelect, onBeginDr
         const temp = dev.temp;
         const rssi = dev.rssi ?? dev.lora_rssi;
         const online = dev.status === 'online';
-        const valveOpen = online && (dev.valve ?? dev.valve_state) === 'open';
+        const valveOpen = liveOn(dev) && (dev.valve ?? dev.valve_state) === 'open';
         const sleepingNode = isSleeping(dev, sleepCfg);
         return (
           <Html position={[0, 2.2, 0]} center distanceFactor={13} className="pointer-events-none select-none">
@@ -1327,11 +1334,12 @@ function NodeMarker({ deviceId, gwColor, selected, editMode, onSelect, onBeginDr
 /* ---- live pump badge (React component so it can subscribe to the store) ---- */
 function PumpStatusBadge({ clusterNodeIds }) {
   const byId = useTwinStore((s) => s.byId);
-  // Only an ONLINE node can vouch for a running pump — a stale pump_state from
-  // an offline device must not show the pump as on.
+  // Only a recently-heard node can vouch for a running pump — a stale
+  // pump_state from a long-offline device must not show the pump as on
+  // (60 s grace so a brief status blip doesn't flap the badge).
   const on = clusterNodeIds.some((nid) => {
     const d = byId[nid];
-    return d?.status === 'online' && (d?.pump ?? d?.pump_state) === 'on';
+    return liveOn(d) && (d?.pump ?? d?.pump_state) === 'on';
   });
   return (
     <div style={{
@@ -1375,12 +1383,13 @@ function GatewayObject({ deviceId, color, editMode, onSelect, onBeginDrag, clust
         ringRef.current.material.opacity = 0.5 * (1 - t);
       }
     }
-    // ── pump — on when ANY ONLINE cluster node has pump running ───
-    // (stale pump_state from an offline device must not spin the pump)
+    // ── pump — on when ANY recently-heard cluster node has pump running ──
+    // (liveOn = 60 s grace: status blips don't stop the impeller, but a
+    // long-offline device's stale pump_state never spins it)
     const byId = useTwinStore.getState().byId;
     const pumpOn = clusterNodeIds.some((nid) => {
       const d = byId[nid];
-      return d?.status === 'online' && (d?.pump ?? d?.pump_state) === 'on';
+      return liveOn(d) && (d?.pump ?? d?.pump_state) === 'on';
     });
     const now = performance.now();
     if (impRef.current) {
@@ -2862,10 +2871,12 @@ function DetailPanel({ canControl, onValve, onClose }) {
   }, [nodeId]);
   if (!sel) return null;
   const status    = sel.status || 'unknown';
-  // Offline devices can't vouch for a live valve/pump — show them off.
-  const valveOpen = status === 'online' && (sel.valve ?? sel.valve_state) === 'open';
+  // Long-offline devices can't vouch for a live valve/pump — show them off.
+  // liveOn keeps a 60 s grace so a brief offline blip doesn't flap the button.
+  const fresh     = liveOn(sel);
+  const valveOpen = fresh && (sel.valve ?? sel.valve_state) === 'open';
   const valvePct  = sel.valve_pct;
-  const pumpOn    = status === 'online' && (sel.pump ?? sel.pump_state) === 'on';
+  const pumpOn    = fresh && (sel.pump ?? sel.pump_state) === 'on';
   const dot = status === 'online' ? 'bg-emerald-500' : status === 'offline' ? 'bg-rose-500' : 'bg-slate-400';
   const pill = status === 'online'
     ? 'bg-emerald-50 text-emerald-700 ring-emerald-200'
@@ -2958,14 +2969,14 @@ function DetailPanel({ canControl, onValve, onClose }) {
         </div>
       </div>
 
-      {canControl && status !== 'online' && (
+      {canControl && !fresh && (
         <div className="px-3 pb-3">
           <div className="w-full text-center text-[11px] text-slate-400 bg-slate-50 border border-slate-100 rounded-xl py-2.5">
             🚫 Node is {status} — valve control unavailable
           </div>
         </div>
       )}
-      {canControl && status === 'online' && (
+      {canControl && fresh && (
         <div className="px-3 pb-3">
           {pendActive ? (
             <button disabled
