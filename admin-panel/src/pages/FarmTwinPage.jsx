@@ -849,6 +849,7 @@ function NodeEnergy({ deviceId, half }) {
 function AllLayerHud({ deviceId, onValve }) {
   const dev      = useTwinStore((s) => s.byId[deviceId]) || {};
   const sleepCfg = useTwinStore((s) => s.sleepCfg[deviceId]);
+  const pending  = useTwinStore((s) => s.valvePending[deviceId]);
   const sleepSt  = sleepCycleState(sleepCfg, dev);
   const [asking, setAsking] = useState(false);
   const [pct, setPct]       = useState(100);
@@ -943,6 +944,11 @@ function AllLayerHud({ deviceId, onValve }) {
         <div className="px-2.5 pb-2.5">
           {!canControl ? (
             <div className="text-center text-[10px] text-slate-400 bg-white/5 rounded-lg py-1.5">🚫 {status} — control unavailable</div>
+          ) : (pending && Date.now() < pending.expires) ? (
+            <button disabled
+              className="w-full text-[12px] font-semibold py-1.5 rounded-lg bg-sky-500/40 text-sky-100 cursor-wait animate-pulse">
+              ⏳ {pending.want === 'open' ? `Opening ${pending.pct}%…` : 'Closing…'}
+            </button>
           ) : valveOpen ? (
             <button onClick={() => onValve(deviceId, false)}
               className="w-full text-[12px] font-semibold py-1.5 rounded-lg bg-slate-600 hover:bg-slate-500 active:scale-[.98] transition-all">
@@ -2822,10 +2828,19 @@ function SleepControl({ nodeId, online, deviceId }) {
 
 function DetailPanel({ canControl, onValve, onClose }) {
   const sel = useTwinStore((s) => (s.selectedId ? s.byId[s.selectedId] : null));
+  const pending = useTwinStore((s) => (s.selectedId ? s.valvePending[s.selectedId] : null));
   const [asking, setAsking] = useState(false);
   const [pct, setPct] = useState(100);
   const [hist, setHist] = useState(null);
   const [cached, setCached] = useState(false);
+  // ticker so the "Opening…" lock visibly releases when its backup timeout passes
+  const [, bump] = useState(0);
+  const pendActive = !!(pending && Date.now() < pending.expires);
+  useEffect(() => {
+    if (!pendActive) return;
+    const t = setInterval(() => bump((n) => n + 1), 500);
+    return () => clearInterval(t);
+  }, [pendActive]);
   const nodeId = sel?._id;
   useEffect(() => {
     if (!nodeId) { setHist(null); setCached(false); return; }
@@ -2952,7 +2967,12 @@ function DetailPanel({ canControl, onValve, onClose }) {
       )}
       {canControl && status === 'online' && (
         <div className="px-3 pb-3">
-          {valveOpen ? (
+          {pendActive ? (
+            <button disabled
+              className="w-full inline-flex items-center justify-center gap-2 text-sm font-semibold px-3 py-2.5 rounded-xl text-white shadow-lg cursor-wait animate-pulse bg-gradient-to-r from-sky-400 to-cyan-400 shadow-sky-400/30">
+              ⏳ {pending.want === 'open' ? `Opening valve to ${pending.pct}%…` : 'Closing valve…'}
+            </button>
+          ) : valveOpen ? (
             <button
               onClick={() => onValve(false)}
               className="w-full inline-flex items-center justify-center gap-2 text-sm font-semibold px-3 py-2.5 rounded-xl text-white shadow-lg transition-all active:scale-[.98] bg-gradient-to-r from-slate-600 to-slate-700 hover:from-slate-700 hover:to-slate-800 shadow-slate-500/20"

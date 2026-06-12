@@ -16,6 +16,11 @@ const LIVE_FIELDS = [
   'charging', 'valve', 'valve_pct', 'pump', 'rssi', 'lastUpdate', 'wokeAt',
   'slpOn', 'slpAwk', 'slpNap', 'slpUp', 'slpStamp',
 ];
+// How long a valve click stays in "opening…/closing…" before the UI gives up
+// waiting: one node report interval (5 s) + 3 s backup margin. Telemetry that
+// confirms the new state clears it sooner.
+const VALVE_PENDING_MS = 5000 + 3000;
+
 let _saveTimer = null;
 function persistLive(get) {
   if (_saveTimer) return;                          // debounce a burst of telemetry
@@ -120,14 +125,20 @@ export const useTwinStore = create((set, get) => ({
     return { byId, selectedId: null, farmId };
   }),
 
-  // Optimistic valve update for instant button feedback. The node's real
-  // valve_state from telemetry is authoritative and overrides this within
-  // seconds (telemetry drives the buttons + water flow — no sticky override).
+  // Pending valve intent per device. Instead of optimistically flipping the
+  // state (which flip-flopped against late telemetry on a lossy LoRa link),
+  // a click marks the device "opening…/closing…" and the button stays locked
+  // until the node's REAL state confirms it — or the backup timeout expires
+  // (node report interval + 3 s). The button changes exactly once.
+  valvePending: {},   // { [device_id]: { want: 'open'|'closed', pct, ts, expires } }
+
   commandValve: (deviceId, open, pct) => set((s) => {
-    const prev = s.byId[deviceId];
-    if (!prev) return {};
-    persistLive(get);
-    return { byId: { ...s.byId, [deviceId]: { ...prev, valve: open ? 'open' : 'closed', valve_pct: open ? pct : 0, lastUpdate: Date.now() } } };
+    if (!s.byId[deviceId]) return {};
+    const now = Date.now();
+    return { valvePending: { ...s.valvePending, [deviceId]: {
+      want: open ? 'open' : 'closed', pct: open ? pct : 0,
+      ts: now, expires: now + VALVE_PENDING_MS,
+    } } };
   }),
 
   // Merge a partial update into one device. No-op if we don't know that device.
@@ -140,8 +151,16 @@ export const useTwinStore = create((set, get) => ({
     // sleep / sleep→wake countdown for the duty cycle.
     const isReport = patch.soil !== undefined || patch.temp !== undefined || patch.bat !== undefined;
     const wokeAt = (isReport && prev.lastUpdate && now - prev.lastUpdate > 20000) ? now : prev.wokeAt;
+    // Resolve a pending valve click: the node's REAL state matching the intent
+    // (or the backup timeout passing) unlocks the button — exactly one change.
+    let valvePending = s.valvePending;
+    const pend = valvePending[deviceId];
+    if (pend && ((patch.valve != null && patch.valve === pend.want) || now > pend.expires)) {
+      valvePending = { ...valvePending };
+      delete valvePending[deviceId];
+    }
     persistLive(get);     // debounced mirror to localStorage (survives refresh)
-    return { byId: { ...s.byId, [deviceId]: { ...prev, ...patch, wokeAt, lastUpdate: now } } };
+    return { byId: { ...s.byId, [deviceId]: { ...prev, ...patch, wokeAt, lastUpdate: now } }, valvePending };
   }),
 
   setPositions: (map)       => set({ positions: map }),
@@ -194,7 +213,7 @@ export const useTwinStore = create((set, get) => ({
   setEditMode: (v)        => set({ editMode: v, dragging: false }),
   setDragging: (v)        => set({ dragging: v }),
   reset:       ()         => set({
-    byId: {}, positions: {}, custom: {}, zones: {}, selectedId: null,
+    byId: {}, positions: {}, custom: {}, zones: {}, selectedId: null, valvePending: {},
     editMode: false, dragging: false, focus: null,
     weatherLocked: false, futureDay: 0, forecast: [],
     playback: { active: false, playing: false, idx: 0, frames: [], from: null, interval: 'hour' },

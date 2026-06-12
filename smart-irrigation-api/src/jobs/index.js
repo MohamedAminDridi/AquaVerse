@@ -25,8 +25,10 @@ exports.startJobs = () => {
   const sweepOffline = async () => {
     const now = Date.now();
 
-    // ── Gateways: offline if no heartbeat in 15 s ─────────────────────
-    const gwCutoff = new Date(now - 15 * 1000);
+    // ── Gateways: offline if no heartbeat in 35 s ─────────────────────
+    // Heartbeat is every 10 s (lightened from 3 s to unclog the gateway's TLS
+    // link) → 35 s tolerates up to two lost heartbeats before declaring death.
+    const gwCutoff = new Date(now - 35 * 1000);
     const offlineGWs = await Gateway.find({
       last_heartbeat: { $lt: gwCutoff },
       status: 'online',
