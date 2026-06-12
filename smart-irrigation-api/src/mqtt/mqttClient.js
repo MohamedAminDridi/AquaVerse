@@ -14,6 +14,7 @@ const SUBS = [
   'farms/+/nodes/+/status',
   'farms/+/nodes/+/alerts',
   'farms/+/gateways/+/heartbeat',
+  'farms/+/gateways/+/status',     // LWT (broker-published on death) + birth message
 ];
 
 const clients = {};        // name -> { client, connected, url }
@@ -130,6 +131,23 @@ async function handleMessage(topic, buffer) {
 
     } else if (category === 'gateways' && msgType === 'heartbeat') {
       await handleGatewayHeartbeat(farmId, deviceId, payload);
+
+    } else if (category === 'gateways' && msgType === 'status') {
+      // Gateway online/offline in real time: the broker publishes the Last Will
+      // ("offline") within seconds of a power cut / WiFi loss, and the gateway
+      // publishes a birth ("online") right after connecting. No more waiting
+      // for the minute-based heartbeat sweep.
+      const Gateway = require('../models/Gateway.model');
+      const statusVal = payload.status === 'online' ? 'online' : 'offline';
+      await Gateway.findOneAndUpdate({ device_id: deviceId }, { status: statusVal });
+      emitToFarm(farmId, 'gateway:status', {
+        device_id: deviceId,
+        status:    statusVal,
+        reason:    payload.reason ?? null,
+        ts:        new Date(),
+      });
+      logger[statusVal === 'offline' ? 'warn' : 'info'](
+        `${statusVal === 'offline' ? '🔌' : '🔆'} Gateway ${deviceId} ${statusVal}${payload.reason ? ` (${payload.reason})` : ''}`);
     }
   } catch (e) {
     logger.error(`MQTT handler [${topic}]: ${e.message}`);

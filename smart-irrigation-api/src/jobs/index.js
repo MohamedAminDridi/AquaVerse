@@ -107,7 +107,10 @@ exports.startJobs = () => {
       });
     }
   };
-  cron.schedule('* * * * *', sweepOffline);
+  // Every 20 s (was a 1-min cron): the sweep is the BACKUP detector — the
+  // gateway's MQTT Last Will handles the instant case; this catches anything
+  // the will misses (e.g. broker restart) and node silences.
+  setInterval(() => sweepOffline().catch((e) => logger.warn(`Sweep failed: ${e.message}`)), 20000);
   setTimeout(() => sweepOffline().catch((e) => logger.warn(`Boot sweep failed: ${e.message}`)), 5000);
 
   // ── Irrigation schedules: open/close valves at their window each minute ──
