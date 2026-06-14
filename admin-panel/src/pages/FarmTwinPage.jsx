@@ -54,7 +54,7 @@ function computeClusterLayout(nodes, gateways, nodeGw) {
   const clusters = gwKeys.length + (orphans.length ? 1 : 0);
   const centreX = (i) => (i - (clusters - 1) / 2) * GW_SPACING;
   const STEP = DEFAULT_SIZE + 2;   // gap so neighbouring square plots don't touch
-  const PER_ROW = 3;               // snake width (keeps a cluster inside its slot)
+  const PER_ROW = 3;               // snake width 
 
   gateways.forEach((g, gi) => {
     const gk = keyOf(g);
