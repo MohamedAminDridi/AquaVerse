@@ -1,535 +1,263 @@
 import { useEffect, useState, useRef } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { io } from 'socket.io-client';
-import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import { motion } from 'framer-motion';
 import api from '../services/api';
 import { useAuthStore } from '../store/authStore';
 import { useAlertStore } from '../store/alertStore';
+import { GlassPanel, MetricTile, RadialGauge, StatusPill, SectionTitle, LiveFeed, Sparkline, CountUp } from '../components/os';
 
-// ── Helpers ───────────────────────────────────────────────────────
-function timeAgo(date) {
-  if (!date) return '—';
-  const s = Math.floor((Date.now() - new Date(date)) / 1000);
-  if (s < 5)    return 'just now';
-  if (s < 60)   return `${s}s ago`;
-  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-  if (s < 86400)return `${Math.floor(s / 3600)}h ago`;
-  return new Date(date).toLocaleDateString();
-}
-function greeting() {
-  const h = new Date().getHours();
-  if (h < 12) return 'Good morning';
-  if (h < 17) return 'Good afternoon';
-  return 'Good evening';
-}
-function soilColor(p) {
-  if (p == null) return 'text-gray-400';
-  if (p < 20)   return 'text-red-600';
-  if (p < 40)   return 'text-yellow-600';
-  if (p < 70)   return 'text-green-700';
-  return 'text-blue-600';
-}
-function soilGrad(p) {
-  if (p == null) return 'from-gray-200 to-gray-300';
-  if (p < 20)   return 'from-red-400 to-red-500';
-  if (p < 40)   return 'from-yellow-400 to-orange-400';
-  if (p < 70)   return 'from-green-400 to-green-600';
-  return 'from-blue-400 to-blue-600';
-}
-function soilText(p) {
-  if (p == null) return '—';
-  if (p < 20)   return 'Very dry';
-  if (p < 40)   return 'Dry';
-  if (p < 70)   return 'Good';
-  return 'Wet';
-}
+const hhmmss = (d) => new Date(d).toLocaleTimeString('en-GB', { hour12: false });
+function greeting() { const h = new Date().getHours(); return h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening'; }
+const soilTone = (p) => (p == null ? '#64748b' : p < 20 ? '#f87171' : p < 40 ? '#fbbf24' : p < 70 ? '#34d399' : '#22d3ee');
 
-const SEV = {
-  critical: { bg: 'bg-red-50',     dot: 'bg-red-500',    text: 'text-red-700',    pill: 'bg-red-100 text-red-700' },
-  warning:  { bg: 'bg-yellow-50',  dot: 'bg-yellow-500', text: 'text-yellow-700', pill: 'bg-yellow-100 text-yellow-700' },
-  info:     { bg: 'bg-blue-50',    dot: 'bg-blue-500',   text: 'text-blue-700',   pill: 'bg-blue-100 text-blue-700' },
-};
-const FARM_GRADS = [
-  'from-green-500 to-emerald-600',
-  'from-teal-500 to-cyan-600',
-  'from-blue-500 to-indigo-600',
-  'from-violet-500 to-purple-600',
-  'from-orange-500 to-amber-600',
-  'from-rose-500 to-pink-600',
-];
-
-// ── Alert row ─────────────────────────────────────────────────────
-function AlertRow({ alert }) {
-  const s = SEV[alert.severity] || SEV.warning;
+/* live clock */
+function MissionClock() {
+  const [t, setT] = useState(new Date());
+  useEffect(() => { const i = setInterval(() => setT(new Date()), 1000); return () => clearInterval(i); }, []);
   return (
-    <div className={`flex items-start gap-3 px-5 py-3 ${s.bg}`}>
-      <span className={`flex-shrink-0 w-2 h-2 rounded-full mt-1.5 ${s.dot}`}/>
-      <div className="flex-1 min-w-0">
-        <p className={`text-sm font-medium ${s.text} truncate`}>{alert.message}</p>
-        <p className="text-xs text-gray-400 mt-0.5">{timeAgo(alert.createdAt)}</p>
+    <div className="text-right">
+      <div className="mono text-2xl font-bold tracking-tight" style={{ color: 'var(--text)' }}>{hhmmss(t)}</div>
+      <div className="text-[11px] text-mute uppercase tracking-[0.15em]">
+        {t.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' })}
       </div>
-      <span className={`text-xs font-semibold px-2 py-0.5 rounded-full flex-shrink-0 ${s.pill}`}>
-        {alert.severity}
-      </span>
     </div>
   );
 }
 
-// ── KPI card ──────────────────────────────────────────────────────
-function KpiCard({ icon, label, value, color, sub, link, danger }) {
-  const inner = (
-    <div className={`bg-white rounded-2xl border shadow-sm p-4 transition-all hover:shadow-md ${
-      danger ? 'border-red-200' : 'border-gray-100'
-    }`}>
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-2xl">{icon}</span>
-        {sub && (
-          <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${
-            danger ? 'bg-red-50 text-red-600' : 'bg-gray-50 text-gray-500'
-          }`}>{sub}</span>
-        )}
-      </div>
-      <p className={`text-2xl font-black leading-tight ${color}`}>{value ?? '—'}</p>
-      <p className="text-xs text-gray-400 mt-0.5">{label}</p>
-    </div>
-  );
-  return link ? <Link to={link}>{inner}</Link> : inner;
-}
-
-// ── Farm overview row ─────────────────────────────────────────────
-function FarmRow({ farm, farmNodes, farmGWs, idx }) {
-  const gradient   = FARM_GRADS[idx % FARM_GRADS.length];
-  const nodesOn    = farmNodes.filter(n => n.status === 'online').length;
-  const nodesOff   = farmNodes.filter(n => n.status === 'offline').length;
-  const gwOn       = farmGWs.filter(g => g.status === 'online').length;
-  const hasOffline = nodesOff > 0 || gwOn < farmGWs.length;
-
-  return (
-    <Link to={`/farms/${farm._id}`}
-      className="flex items-center gap-4 px-5 py-3.5 hover:bg-gray-50 transition-colors group">
-      {/* Color dot */}
-      <div className={`w-9 h-9 rounded-xl bg-gradient-to-br ${gradient} flex items-center justify-center flex-shrink-0 text-white text-sm font-bold`}>
-        {farm.name.charAt(0).toUpperCase()}
-      </div>
-      {/* Info */}
-      <div className="flex-1 min-w-0">
-        <p className="text-sm font-semibold text-gray-900 truncate">{farm.name}</p>
-        <p className="text-xs text-gray-400">{farm.crop_type || 'No crop'} · {farm.size_ha ? `${farm.size_ha} ha` : '—'}</p>
-      </div>
-      {/* Status chips */}
-      <div className="flex items-center gap-2 flex-shrink-0">
-        <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
-          nodesOff > 0 ? 'bg-red-100 text-red-600' : 'bg-green-100 text-green-700'
-        }`}>
-          🔌 {nodesOn}/{farmNodes.length}
-        </span>
-        <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${
-          gwOn < farmGWs.length ? 'bg-red-100 text-red-600' : 'bg-blue-100 text-blue-700'
-        }`}>
-          📡 {gwOn}/{farmGWs.length}
-        </span>
-      </div>
-      <span className="text-gray-300 group-hover:text-green-500 transition-colors text-xs">→</span>
-    </Link>
-  );
-}
-
-// ── Node mini card ────────────────────────────────────────────────
-function NodeMiniCard({ node, live, farmId }) {
-  const d      = live || {};
-  const soil   = d.soil_moisture_pct ?? null;
-  const temp   = d.temperature_c ?? null;
-  const bat    = d.battery_pct ?? node.battery_pct;
-  const charging = d.charging ?? d.battery_charging ?? node.battery_charging;
-  const online = node.status === 'online';
-  const batColor = bat == null ? 'text-gray-400' : bat > 60 ? 'text-green-600' : bat > 30 ? 'text-yellow-500' : 'text-red-500';
-
-  return (
-    <Link to={`/farms/${farmId}`}
-      className={`rounded-2xl border p-3 space-y-2 transition-all hover:shadow-md hover:-translate-y-0.5 block ${
-        online ? 'bg-white border-green-200' : 'bg-red-50 border-red-200'
-      }`}>
-      {/* Top bar */}
-      <div className={`h-0.5 -mx-3 -mt-3 rounded-t-2xl ${
-        online ? 'bg-gradient-to-r from-green-400 to-emerald-500' : 'bg-red-400'
-      }`}/>
-      <div className="flex items-start justify-between gap-1">
-        <p className="text-xs font-semibold text-gray-800 truncate leading-tight">{node.name}</p>
-        <span className={`flex-shrink-0 w-1.5 h-1.5 rounded-full mt-0.5 ${
-          online ? 'bg-green-500' : 'bg-red-500'
-        }`}/>
-      </div>
-      {/* Soil bar */}
-      <div className="space-y-0.5">
-        <div className="flex justify-between text-xs">
-          <span className="text-gray-400">🌱 Soil</span>
-          <span className={`font-semibold ${soilColor(soil)}`}>{soil != null ? `${soil}%` : '—'}</span>
-        </div>
-        <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
-          <div className={`h-full rounded-full bg-gradient-to-r ${soilGrad(soil)} transition-all duration-500`}
-               style={{ width: `${soil ?? 0}%` }}/>
-        </div>
-      </div>
-      {/* Temp + Battery */}
-      <div className="flex items-center justify-between">
-        {temp != null ? (
-          <p className={`text-xs font-bold ${temp > 35 ? 'text-red-500' : temp > 28 ? 'text-orange-500' : 'text-gray-500'}`}>🌡️ {temp.toFixed(1)}°C</p>
-        ) : <span />}
-        <p className={`text-xs font-bold ${charging ? 'text-amber-500' : batColor}`}>
-          {charging ? '⚡' : '🔋'} {bat != null ? `${bat}%` : '—'}
-        </p>
-      </div>
-    </Link>
-  );
-}
-
-// ── Main page ─────────────────────────────────────────────────────
 export default function DashboardPage() {
-  const [farmsData, setFarmsData] = useState([]); // [{farm, nodes, gateways}]
-  const [alerts,    setAlerts]    = useState([]);
-  const [summary,   setSummary]   = useState(null);
-  const [liveData,  setLiveData]  = useState({});
-  const [loading,   setLoading]   = useState(true);
-  const [, setTick]               = useState(0);
+  const [farmsData, setFarmsData] = useState([]);
+  const [alerts, setAlerts]   = useState([]);
+  const [summary, setSummary] = useState(null);
+  const [liveData, setLiveData] = useState({});
+  const [feed, setFeed]       = useState([]);          // telemetry console
+  const [sparks, setSparks]   = useState({ soil: [], nodes: [] });
+  const [loading, setLoading] = useState(true);
+  const [, setTick]           = useState(0);
 
-  const token       = useAuthStore(s => s.token);
-  const user        = useAuthStore(s => s.user);
-  const unreadCount = useAlertStore(s => s.unreadCount);
-  const socketRef   = useRef(null);
-  const nav         = useNavigate();
+  const token = useAuthStore((s) => s.token);
+  const user  = useAuthStore((s) => s.user);
+  const unreadCount = useAlertStore((s) => s.unreadCount);
+  const socketRef = useRef(null);
 
-  useEffect(() => {
-    const id = setInterval(() => setTick(t => t + 1), 5000);
-    return () => clearInterval(id);
-  }, []);
+  useEffect(() => { const id = setInterval(() => setTick((t) => t + 1), 5000); return () => clearInterval(id); }, []);
 
   useEffect(() => {
-    async function load() {
+    (async () => {
       try {
         const [farmsRes, alertsRes] = await Promise.all([
-          api.get('/farms'),
-          api.get('/alerts?acknowledged=false&limit=5'),
+          api.get('/farms'), api.get('/alerts?acknowledged=false&limit=8'),
         ]);
         const farmList = farmsRes.data.data.farms || [];
         setAlerts(alertsRes.data.data || []);
-
-        if (farmList.length > 0) {
+        if (farmList.length) {
           const [nodeResults, gwResults] = await Promise.all([
-            Promise.all(farmList.map(f =>
-              api.get(`/farms/${f._id}/nodes`).then(r => r.data.data.nodes || []).catch(() => [])
-            )),
-            Promise.all(farmList.map(f =>
-              api.get(`/farms/${f._id}/gateways`).then(r => r.data.data.gateways || []).catch(() => [])
-            )),
+            Promise.all(farmList.map((f) => api.get(`/farms/${f._id}/nodes`).then((r) => r.data.data.nodes || []).catch(() => []))),
+            Promise.all(farmList.map((f) => api.get(`/farms/${f._id}/gateways`).then((r) => r.data.data.gateways || []).catch(() => []))),
           ]);
-
-          const combined = farmList.map((farm, i) => ({
-            farm,
-            nodes:    nodeResults[i],
-            gateways: gwResults[i],
-          }));
-          setFarmsData(combined);
-
-          // Analytics summary for first farm
-          api.get(`/analytics/farms/${farmList[0]._id}/summary?from=7d`)
-            .then(r => setSummary(r.data.data?.summary))
-            .catch(() => {});
+          setFarmsData(farmList.map((farm, i) => ({ farm, nodes: nodeResults[i], gateways: gwResults[i] })));
+          api.get(`/analytics/farms/${farmList[0]._id}/summary?from=7d`).then((r) => setSummary(r.data.data?.summary)).catch(() => {});
         }
-      } finally {
-        setLoading(false);
-      }
-    }
-    load();
+      } finally { setLoading(false); }
+    })();
   }, []);
 
-  // Live socket across all farms
   useEffect(() => {
     if (!token || farmsData.length === 0) return;
-    const s = io(import.meta.env.VITE_API_URL || undefined, {
-      auth: { token }, transports: ['websocket', 'polling'],
-    });
+    const s = io(import.meta.env.VITE_API_URL || undefined, { auth: { token }, transports: ['websocket', 'polling'] });
     socketRef.current = s;
-    s.on('connect', () => farmsData.forEach(fd => s.emit('join:farm', fd.farm._id)));
-    s.on('sensor:data', d => {
-      setLiveData(prev => ({ ...prev, [d.deviceId]: d }));
-      setFarmsData(prev => prev.map(fd => ({
-        ...fd,
-        nodes: fd.nodes.map(n =>
-          n.device_id === d.deviceId ? { ...n, status: 'online', last_seen: new Date() } : n
-        ),
-      })));
+    s.on('connect', () => farmsData.forEach((fd) => s.emit('join:farm', fd.farm._id)));
+    s.on('sensor:data', (d) => {
+      setLiveData((prev) => ({ ...prev, [d.deviceId]: d }));
+      setFarmsData((prev) => prev.map((fd) => ({ ...fd, nodes: fd.nodes.map((n) => n.device_id === d.deviceId ? { ...n, status: 'online', last_seen: new Date() } : n) })));
+      setFeed((prev) => [{ id: Math.random(), time: hhmmss(Date.now()), color: soilTone(d.soil_moisture_pct),
+        text: `${d.deviceId} · soil ${d.soil_moisture_pct ?? '—'}% · ${d.temperature_c ?? '—'}°C · bat ${d.battery_pct ?? '—'}%` }, ...prev].slice(0, 40));
+      if (d.soil_moisture_pct != null) setSparks((p) => ({ ...p, soil: [...p.soil, d.soil_moisture_pct].slice(-40) }));
     });
-    s.on('node:status', d => {
+    s.on('node:status', (d) => {
       const on = d.online ?? (d.status === 'online');
-      setFarmsData(prev => prev.map(fd => ({
-        ...fd,
-        nodes: fd.nodes.map(n =>
-          n.device_id === d.device_id ? { ...n, status: on ? 'online' : 'offline' } : n
-        ),
-      })));
+      setFarmsData((prev) => prev.map((fd) => ({ ...fd, nodes: fd.nodes.map((n) => n.device_id === d.device_id ? { ...n, status: on ? 'online' : 'offline' } : n) })));
     });
-    s.on('gateway:status', d => {
-      setFarmsData(prev => prev.map(fd => ({
-        ...fd,
-        gateways: fd.gateways.map(g =>
-          g.device_id === d.device_id ? { ...g, status: d.status } : g
-        ),
-      })));
-    });
-    s.on('alert:new', a => setAlerts(prev => [a, ...prev].slice(0, 5)));
+    s.on('gateway:status', (d) => setFarmsData((prev) => prev.map((fd) => ({ ...fd, gateways: fd.gateways.map((g) => g.device_id === d.device_id ? { ...g, status: d.status } : g) }))));
+    s.on('alert:new', (a) => setAlerts((prev) => [a, ...prev].slice(0, 8)));
     return () => { socketRef.current?.disconnect(); socketRef.current = null; };
   }, [token, farmsData.length]);
 
-  // Aggregated stats
-  const allNodes    = farmsData.flatMap(fd => fd.nodes);
-  const allGWs      = farmsData.flatMap(fd => fd.gateways);
-  const nodesOnline = allNodes.filter(n => n.status === 'online').length;
-  const nodesOff    = allNodes.filter(n => n.status === 'offline').length;
-  const gwOnline    = allGWs.filter(g => g.status === 'online').length;
-  const gwOff       = allGWs.filter(g => g.status === 'offline').length;
-  const hasCritical = alerts.some(a => a.severity === 'critical');
+  const allNodes = farmsData.flatMap((fd) => fd.nodes);
+  const allGWs   = farmsData.flatMap((fd) => fd.gateways);
+  const nodesOnline = allNodes.filter((n) => n.status === 'online').length;
+  const nodesOff = allNodes.length - nodesOnline;
+  const gwOnline = allGWs.filter((g) => g.status === 'online').length;
+  const gwOff = allGWs.length - gwOnline;
+  const avgSoil = (() => { const v = Object.values(liveData).map((d) => d.soil_moisture_pct).filter((x) => x != null); return v.length ? Math.round(v.reduce((a, b) => a + b, 0) / v.length) : (summary?.avg_soil_moisture ?? null); })();
 
-  const systemOk = nodesOff === 0 && gwOff === 0 && unreadCount === 0;
-  const heroGrad = hasCritical && unreadCount > 0
-    ? 'from-red-600 via-rose-600 to-orange-600 shadow-red-200'
-    : unreadCount > 0
-    ? 'from-yellow-500 via-orange-500 to-amber-600 shadow-orange-200'
-    : 'from-green-600 via-emerald-600 to-teal-600 shadow-green-200';
+  // farm health score: node uptime (60%) + gateway uptime (25%) − alert penalty (15%)
+  const upN = allNodes.length ? nodesOnline / allNodes.length : 1;
+  const upG = allGWs.length ? gwOnline / allGWs.length : 1;
+  const penalty = Math.min(1, (alerts.filter((a) => a.severity === 'critical').length * 0.34) + (unreadCount * 0.05));
+  const health = Math.round(Math.max(0, (upN * 0.6 + upG * 0.25 + 0.15) - penalty * 0.15) * 100);
+  const healthColor = health >= 85 ? '#34d399' : health >= 60 ? '#fbbf24' : '#f87171';
+
+  const SEVCOL = { critical: '#f87171', warning: '#fbbf24', info: '#22d3ee' };
 
   return (
-    <div className="space-y-6 pb-8">
-
-      {/* ── Hero ── */}
-      <div className={`relative overflow-hidden rounded-3xl p-6 text-white shadow-lg bg-gradient-to-br ${heroGrad}`}>
-        <div className="absolute -top-8 -right-8 w-40 h-40 bg-white/10 rounded-full"/>
-        <div className="absolute -bottom-12 right-24 w-56 h-56 bg-white/5 rounded-full"/>
-        <div className="relative flex flex-wrap items-center justify-between gap-4">
-          <div>
-            <p className="text-white/70 text-sm">{greeting()}, {user?.name || 'Admin'}</p>
-            <h1 className="text-3xl font-black mt-1">Dashboard</h1>
-            <p className="text-white/80 text-sm mt-1">
-              {systemOk
-                ? '✓ All systems operational'
-                : [
-                    nodesOff  > 0 && `${nodesOff} node${nodesOff > 1 ? 's' : ''} offline`,
-                    gwOff     > 0 && `${gwOff} gateway${gwOff > 1 ? 's' : ''} offline`,
-                    unreadCount > 0 && `${unreadCount} active alert${unreadCount > 1 ? 's' : ''}`,
-                  ].filter(Boolean).join(' · ')
-              }
-            </p>
+    <div className="relative space-y-5 pb-10">
+      {/* ── command bar ── */}
+      <GlassPanel scan className="p-5 flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-2 text-[11px] uppercase tracking-[0.22em] text-mute">
+            <span className="w-2 h-2 rounded-full os-live" style={{ background: '#34d399', color: '#34d399' }} />
+            AquaVerse Mission Control
           </div>
-          <div className="text-right">
-            <p className="text-white/60 text-xs">
-              {new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' })}
-            </p>
-            <p className="text-white/80 text-sm font-medium mt-0.5">
-              {farmsData.length} farm{farmsData.length !== 1 ? 's' : ''} monitored
-            </p>
-          </div>
+          <h1 className="text-2xl font-bold mt-1" style={{ color: 'var(--text)' }}>
+            {greeting()}, {user?.name || 'Operator'}
+          </h1>
+          <p className="text-sm text-dim mt-0.5">
+            Monitoring <span className="mono" style={{ color: 'var(--accent)' }}>{farmsData.length}</span> farm{farmsData.length !== 1 ? 's' : ''} ·
+            <span className="mono" style={{ color: 'var(--accent)' }}> {allNodes.length}</span> nodes ·
+            <span className="mono" style={{ color: 'var(--accent)' }}> {allGWs.length}</span> gateways
+          </p>
         </div>
+        <MissionClock />
+      </GlassPanel>
+
+      {/* ── KPI strip ── */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <MetricTile delay={0.05} label="Nodes online" value={nodesOnline} unit={`/ ${allNodes.length}`}
+          danger={nodesOff > 0} sub={nodesOff > 0 ? `${nodesOff} offline` : 'all reporting'} accent="#34d399" />
+        <MetricTile delay={0.1} label="Gateways" value={gwOnline} unit={`/ ${allGWs.length}`}
+          danger={gwOff > 0} sub={gwOff > 0 ? `${gwOff} down` : 'all linked'} accent="#22d3ee" />
+        <MetricTile delay={0.15} label="Avg soil" value={avgSoil} unit="%"
+          sub="live fleet mean" accent={soilTone(avgSoil)} spark={sparks.soil} />
+        <MetricTile delay={0.2} label="Active alerts" value={unreadCount}
+          danger={unreadCount > 0} sub={unreadCount > 0 ? 'needs attention' : 'all clear'} accent="#fbbf24" />
       </div>
 
-      {/* ── KPI row ── */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        <KpiCard icon="🗺" label="Total farms"
-          value={farmsData.length}
-          color="text-gray-900"
-          link="/farms"/>
-        <KpiCard icon="🔌" label="Nodes online"
-          value={loading ? '…' : `${nodesOnline} / ${allNodes.length}`}
-          color={nodesOff > 0 ? 'text-red-600' : 'text-green-700'}
-          sub={!loading && (nodesOff > 0 ? `${nodesOff} offline` : 'All online')}
-          danger={nodesOff > 0}
-          link="/nodes"/>
-        <KpiCard icon="🔔" label="Active alerts"
-          value={unreadCount}
-          color={unreadCount > 0 ? 'text-red-600' : 'text-gray-400'}
-          sub={unreadCount > 0 ? 'Needs attention' : 'All clear'}
-          danger={unreadCount > 0}
-          link="/alerts"/>
-        <KpiCard icon="📡" label="Gateways"
-          value={loading ? '…' : `${gwOnline} / ${allGWs.length}`}
-          color={gwOff > 0 ? 'text-red-600' : 'text-blue-700'}
-          sub={!loading && (gwOff > 0 ? `${gwOff} offline` : 'All online')}
-          danger={gwOff > 0}
-          link="/gateways"/>
+      {/* ── health + vitals + live feed ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <GlassPanel hover delay={0.1} className="p-5 flex flex-col items-center justify-center">
+          <SectionTitle>Farm Health</SectionTitle>
+          <RadialGauge value={health} label="index" color={healthColor} />
+          <div className="mt-3 flex gap-2">
+            <StatusPill tone={upN === 1 ? 'ok' : 'warn'} label={`NODES ${Math.round(upN * 100)}%`} />
+            <StatusPill tone={upG === 1 ? 'ok' : 'warn'} label={`UPLINK ${Math.round(upG * 100)}%`} />
+          </div>
+        </GlassPanel>
+
+        <GlassPanel hover delay={0.15} className="p-5 lg:col-span-2">
+          <SectionTitle right={<span className="text-[11px] text-mute mono">live</span>}>Telemetry Stream</SectionTitle>
+          <LiveFeed items={feed} height={232} />
+        </GlassPanel>
       </div>
 
-      {/* ── Analytics banner (7d summary) ── */}
-      {summary && (
-        <div className="bg-white rounded-3xl border border-gray-100 shadow-sm overflow-hidden">
-          <div className="px-5 py-4 border-b border-gray-50">
-            <p className="text-xs font-semibold text-gray-400 uppercase tracking-widest">7-day analytics</p>
-          </div>
-          <div className="grid grid-cols-2 md:grid-cols-4 divide-x divide-gray-100">
-            {[
-              {
-                icon: '🌱', label: 'Avg soil moisture',
-                value: summary.avg_soil_moisture != null ? `${summary.avg_soil_moisture}%` : '—',
-                color: soilColor(summary.avg_soil_moisture),
-                sub: soilText(summary.avg_soil_moisture),
-              },
-              {
-                icon: '🌡️', label: 'Avg temperature',
-                value: summary.avg_temperature != null ? `${summary.avg_temperature}°C` : '—',
-                color: summary.avg_temperature > 35 ? 'text-red-600' : summary.avg_temperature > 28 ? 'text-orange-500' : 'text-gray-800',
-              },
-              {
-                icon: '🔌', label: 'Active nodes',
-                value: summary.active_nodes ?? '—',
-                color: 'text-gray-900',
-              },
-              {
-                icon: '📊', label: 'Total readings',
-                value: summary.total_readings?.toLocaleString() ?? '—',
-                color: 'text-gray-900',
-                sub: 'Sensor packets',
-              },
-            ].map(m => (
-              <div key={m.label} className="px-5 py-4">
-                <div className="flex items-center gap-2 mb-1">
-                  <span className="text-base">{m.icon}</span>
-                  {m.sub && <span className="text-xs text-gray-400">{m.sub}</span>}
-                </div>
-                <p className={`text-xl font-black ${m.color}`}>{m.value}</p>
-                <p className="text-xs text-gray-400 mt-0.5">{m.label}</p>
-              </div>
-            ))}
-          </div>
+      {/* ── system vitals row ── */}
+      <GlassPanel hover delay={0.2} className="p-4">
+        <SectionTitle>System Vitals</SectionTitle>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+          {[
+            ['MQTT broker', allGWs.length && gwOnline ? 'live' : 'idle'],
+            ['Realtime link', socketRef.current ? 'live' : 'idle'],
+            ['Edge AI', 'live'],
+            ['Database', 'ok'],
+          ].map(([k, tone], i) => (
+            <div key={k} className="flex items-center justify-between rounded-xl px-3 py-2.5" style={{ background: 'var(--panel-2)', border: '1px solid var(--border)' }}>
+              <span className="text-dim text-[12px]">{k}</span>
+              <StatusPill tone={tone} live={tone === 'live'} />
+            </div>
+          ))}
         </div>
-      )}
+      </GlassPanel>
 
-      {/* ── 2-col: Alerts + Farm overview ── */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-
-        {/* Active alerts */}
-        <div className="bg-white rounded-3xl border border-gray-100 shadow-sm overflow-hidden">
-          <div className="px-5 py-4 border-b border-gray-50 flex items-center justify-between">
-            <h2 className="font-bold text-gray-900 flex items-center gap-2">
-              🔔 Active Alerts
-              {unreadCount > 0 && (
-                <span className="bg-red-500 text-white text-xs font-bold px-1.5 py-0.5 rounded-full">
-                  {unreadCount}
-                </span>
-              )}
-            </h2>
-            <Link to="/alerts" className="text-xs text-green-600 hover:underline font-medium">
-              View all →
-            </Link>
-          </div>
+      {/* ── alerts console + farm fleet ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <GlassPanel hover delay={0.1} className="p-5">
+          <SectionTitle right={<Link to="/alerts" className="text-[11px] mono" style={{ color: 'var(--accent)' }}>VIEW ALL →</Link>}>Incident Log</SectionTitle>
           {alerts.length === 0 ? (
-            <div className="p-10 text-center">
-              <div className="text-5xl mb-3">✅</div>
-              <p className="text-sm font-semibold text-gray-700">No active alerts</p>
-              <p className="text-xs text-gray-400 mt-1">Your farms are running smoothly</p>
-            </div>
+            <div className="py-10 text-center text-dim text-sm">✓ no active incidents</div>
           ) : (
-            <div className="divide-y divide-gray-50">
-              {alerts.map((a, i) => <AlertRow key={a._id || i} alert={a}/>)}
-              {unreadCount > 5 && (
-                <div className="px-5 py-3 text-center">
-                  <Link to="/alerts" className="text-xs text-green-600 hover:underline font-medium">
-                    + {unreadCount - 5} more alerts — view all
-                  </Link>
-                </div>
-              )}
+            <div className="space-y-1.5">
+              {alerts.map((a, i) => (
+                <motion.div key={a._id || i} initial={{ opacity: 0, x: -8 }} animate={{ opacity: 1, x: 0 }} transition={{ delay: i * 0.04 }}
+                  className="flex items-start gap-3 rounded-xl px-3 py-2.5" style={{ background: 'var(--panel-2)', border: '1px solid var(--border)' }}>
+                  <span className="w-2 h-2 rounded-full mt-1.5 shrink-0" style={{ background: SEVCOL[a.severity] || '#fbbf24' }} />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[13px] truncate" style={{ color: 'var(--text)' }}>{a.message}</p>
+                    <p className="text-[10px] text-mute mono mt-0.5">{a.createdAt ? hhmmss(a.createdAt) : ''}</p>
+                  </div>
+                  <span className="text-[10px] font-bold uppercase shrink-0" style={{ color: SEVCOL[a.severity] || '#fbbf24' }}>{a.severity}</span>
+                </motion.div>
+              ))}
             </div>
           )}
-        </div>
+        </GlassPanel>
 
-        {/* Farm overview */}
-        <div className="bg-white rounded-3xl border border-gray-100 shadow-sm overflow-hidden">
-          <div className="px-5 py-4 border-b border-gray-50 flex items-center justify-between">
-            <h2 className="font-bold text-gray-900">🗺 Farm Overview</h2>
-            <Link to="/farms" className="text-xs text-green-600 hover:underline font-medium">
-              Manage →
-            </Link>
+        <GlassPanel hover delay={0.15} className="p-5">
+          <SectionTitle right={<Link to="/farms" className="text-[11px] mono" style={{ color: 'var(--accent)' }}>MANAGE →</Link>}>Farm Fleet</SectionTitle>
+          <div className="space-y-1.5">
+            {loading && [1, 2].map((i) => <div key={i} className="h-14 rounded-xl animate-pulse" style={{ background: 'var(--panel-2)' }} />)}
+            {!loading && farmsData.length === 0 && <div className="py-8 text-center text-dim text-sm">no farms yet</div>}
+            {farmsData.map((fd, i) => {
+              const on = fd.nodes.filter((n) => n.status === 'online').length;
+              const gwon = fd.gateways.filter((g) => g.status === 'online').length;
+              const ok = on === fd.nodes.length && gwon === fd.gateways.length;
+              return (
+                <Link key={fd.farm._id} to={`/farms/${fd.farm._id}`}
+                  className="flex items-center gap-3 rounded-xl px-3 py-2.5 transition-colors"
+                  style={{ background: 'var(--panel-2)', border: '1px solid var(--border)' }}>
+                  <div className="w-9 h-9 rounded-lg grid place-items-center font-bold text-sm shrink-0"
+                    style={{ background: ok ? 'rgba(52,211,153,0.15)' : 'rgba(251,191,36,0.15)', color: ok ? '#34d399' : '#fbbf24' }}>
+                    {fd.farm.name.charAt(0).toUpperCase()}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[13px] font-semibold truncate" style={{ color: 'var(--text)' }}>{fd.farm.name}</p>
+                    <p className="text-[11px] text-mute">{fd.farm.crop_type || 'mixed'} · {fd.farm.size_ha ? `${fd.farm.size_ha} ha` : '—'}</p>
+                  </div>
+                  <div className="text-right mono text-[11px]">
+                    <div style={{ color: on === fd.nodes.length ? '#34d399' : '#f87171' }}>🔌 {on}/{fd.nodes.length}</div>
+                    <div style={{ color: gwon === fd.gateways.length ? '#22d3ee' : '#f87171' }}>📡 {gwon}/{fd.gateways.length}</div>
+                  </div>
+                </Link>
+              );
+            })}
           </div>
-          {loading ? (
-            <div className="p-5 space-y-3">
-              {[1, 2].map(i => (
-                <div key={i} className="h-14 bg-gray-100 rounded-xl animate-pulse"/>
-              ))}
-            </div>
-          ) : farmsData.length === 0 ? (
-            <div className="p-10 text-center">
-              <div className="text-5xl mb-3">🌱</div>
-              <p className="text-sm font-semibold text-gray-700">No farms yet</p>
-              <Link to="/farms"
-                className="text-xs text-green-600 hover:underline mt-2 inline-block">
-                + Create first farm
-              </Link>
-            </div>
-          ) : (
-            <div className="divide-y divide-gray-50">
-              {farmsData.map((fd, i) => (
-                <FarmRow
-                  key={fd.farm._id}
-                  farm={fd.farm}
-                  farmNodes={fd.nodes}
-                  farmGWs={fd.gateways}
-                  idx={i}
-                />
-              ))}
-            </div>
-          )}
-        </div>
+        </GlassPanel>
       </div>
 
-      {/* ── Live nodes grid ── */}
+      {/* ── live nodes grid ── */}
       {allNodes.length > 0 && (
-        <div className="space-y-3">
-          <div className="flex items-center justify-between">
-            <h2 className="font-bold text-gray-900">
-              🔌 Live Nodes
-              <span className="ml-2 text-sm text-gray-400 font-normal">{allNodes.length} total</span>
-            </h2>
-            <Link to="/nodes" className="text-xs text-green-600 hover:underline font-medium">
-              All nodes →
-            </Link>
-          </div>
-          {nodesOff > 0 && (
-            <div className="flex items-center gap-3 bg-red-50 border border-red-200 rounded-2xl px-4 py-3">
-              <span className="text-lg">🚨</span>
-              <p className="text-sm font-semibold text-red-700">
-                {nodesOff} node{nodesOff > 1 ? 's' : ''} offline — check LoRa connection
-              </p>
-            </div>
-          )}
+        <div>
+          <SectionTitle right={<Link to="/nodes" className="text-[11px] mono" style={{ color: 'var(--accent)' }}>ALL NODES →</Link>}>Live Nodes · {allNodes.length}</SectionTitle>
           <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-6 gap-3">
-            {farmsData.flatMap(fd =>
-              fd.nodes.map(node => (
-                <NodeMiniCard
-                  key={node._id}
-                  node={node}
-                  live={liveData[node.device_id]}
-                  farmId={fd.farm._id}
-                />
-              ))
-            )}
+            {farmsData.flatMap((fd) => fd.nodes.map((node, i) => {
+              const d = liveData[node.device_id] || {};
+              const soil = d.soil_moisture_pct ?? null;
+              const bat = d.battery_pct ?? node.battery_pct;
+              const online = node.status === 'online';
+              return (
+                <GlassPanel key={node._id} hover delay={Math.min(i * 0.03, 0.4)} className="p-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[12px] font-semibold truncate" style={{ color: 'var(--text)' }}>{node.name}</span>
+                    <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: online ? '#34d399' : '#f87171' }} />
+                  </div>
+                  <div className="mt-2 flex items-end gap-1">
+                    <span className="text-xl font-bold mono" style={{ color: soilTone(soil) }}>{soil ?? '—'}</span>
+                    <span className="text-[10px] text-mute mb-0.5">% soil</span>
+                  </div>
+                  <div className="h-1.5 rounded-full overflow-hidden mt-1.5" style={{ background: 'var(--border)' }}>
+                    <div className="h-full rounded-full transition-all duration-700" style={{ width: `${soil ?? 0}%`, background: soilTone(soil), boxShadow: `0 0 6px ${soilTone(soil)}` }} />
+                  </div>
+                  <div className="mt-2 flex items-center justify-between text-[11px] mono">
+                    <span className="text-dim">{d.temperature_c != null ? `${d.temperature_c.toFixed(1)}°` : '—'}</span>
+                    <span style={{ color: bat == null ? 'var(--text-mute)' : bat > 30 ? '#34d399' : '#f87171' }}>
+                      {(d.charging ?? node.battery_charging) ? '⚡' : '🔋'} {bat ?? '—'}%
+                    </span>
+                  </div>
+                </GlassPanel>
+              );
+            }))}
           </div>
         </div>
       )}
-
-      {/* ── Quick links ── */}
-      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-        {[
-          { to: '/nodes',    icon: '🔌', label: 'Nodes',     desc: 'View & control'     },
-          { to: '/gateways', icon: '📡', label: 'Gateways',  desc: 'Network status'     },
-          { to: '/alerts',   icon: '🔔', label: 'Alerts',    desc: 'Review & acknowledge' },
-          { to: '/analytics',icon: '📊', label: 'Analytics', desc: 'Trends & reports'   },
-        ].map(l => (
-          <Link key={l.to} to={l.to}
-            className="bg-white border border-gray-100 rounded-2xl p-4 shadow-sm
-                       hover:shadow-md hover:-translate-y-0.5 transition-all group">
-            <span className="text-2xl">{l.icon}</span>
-            <p className="font-semibold text-gray-900 mt-2 text-sm group-hover:text-green-700 transition-colors">
-              {l.label}
-            </p>
-            <p className="text-xs text-gray-400 mt-0.5">{l.desc}</p>
-          </Link>
-        ))}
-      </div>
     </div>
   );
 }

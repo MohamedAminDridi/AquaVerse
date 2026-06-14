@@ -61,6 +61,7 @@ app.use('/api',              require('./routes/schedule.routes'));
 // Top-level feature routes
 app.use('/api/alerts',       require('./routes/alert.routes'));
 app.use('/api/analytics',    require('./routes/analytics.routes'));
+app.use('/api/ai',           require('./routes/ai.routes'));
 app.use('/api/weather',      require('./routes/weather.routes'));
 
 app.get('/health', (_, res) => res.json({ status: 'ok', db: 'mongodb', ts: new Date() }));

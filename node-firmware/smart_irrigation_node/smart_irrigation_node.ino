@@ -404,6 +404,11 @@ void handleIncoming() {
     return;
   }
 
+  // Binary control frames (resilience layer, magic 0xA5 — heartbeat beacons,
+  // elections…) are handled by the unified firmware; this production sketch
+  // ignores them silently instead of logging a JSON error every 10 s.
+  if (len > 0 && (uint8_t)buf[0] == 0xA5) return;
+
   // JSON command
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, buf, len);

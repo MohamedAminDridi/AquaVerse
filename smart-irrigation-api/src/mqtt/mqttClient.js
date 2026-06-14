@@ -211,8 +211,10 @@ const publish = (topic, payload, opts = { qos: 1 }) => {
   for (const name of Object.keys(clients)) {
     if (clients[name].connected) { clients[name].client.publish(topic, msg, opts); sent = true; }
   }
-  if (sent) logger.info(`📤 MQTT publish → ${topic}`);
-  else      logger.warn(`MQTT not connected — dropped: ${topic}`);
+  // heartbeat beacons fire every 10 s — keep them out of the info log stream
+  const quiet = topic.endsWith('/system/heartbeat');
+  if (sent) logger[quiet ? 'debug' : 'info'](`📤 MQTT publish → ${topic}`);
+  else if (!quiet) logger.warn(`MQTT not connected — dropped: ${topic}`);
   return sent;
 };
 

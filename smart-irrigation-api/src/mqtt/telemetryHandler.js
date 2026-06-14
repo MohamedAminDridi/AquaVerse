@@ -56,6 +56,11 @@ module.exports = async function handleTelemetry(farmId, nodeDeviceId, payload) {
     let   pumpState  = payload.pump_state ?? payload.pump ?? null;
     if (pumpState == null && payload.p != null) pumpState = payload.p ? 'on' : 'off';
 
+    // Resilience mode reported by unified firmware: md 0=CLOUD 1=AUTONOMOUS,
+    // ai = node's view of the edge-AI switch. Forwarded for the mode indicator.
+    const sysMode = payload.md ?? null;
+    const aiFlag  = payload.ai ?? null;
+
     // Deep-sleep duty-cycle timing reported by the node (slp/awk/nap/up). The
     // dashboard anchors its awake↔sleep countdown to these real device clocks.
     const slpOn  = payload.slp != null ? !!payload.slp : null;  // sleep mode active?
@@ -95,6 +100,31 @@ module.exports = async function handleTelemetry(farmId, nodeDeviceId, payload) {
       rssi,
     });
 
+    // ── Shadow AI: trust + decision on every packet (never actuates) ──
+    // Emitted with the telemetry for the AI Brain layer; persisted + broadcast
+    // separately only when the decision changes (no DB spam at 5 s cadence).
+    let ai = null;
+    try {
+      const edgeAi = require('../services/edgeAi.service');
+      ai = edgeAi.evaluate(node.device_id, { soil, temp, hum, valveState });
+      if (ai.changed) {
+        const Decision = require('../models/Decision.model');
+        const rec = await Decision.create({
+          farm: node.farm, deviceId: node.device_id,
+          inputs: ai.dec.in, irrigate: ai.dec.irr, duration_s: ai.dec.dur,
+          why: ai.dec.why, agree: ai.dec.agree,
+          trust_score: ai.trust.score, trust_reasons: ai.trust.reasons,
+          modelVersion: ai.dec.v,
+        });
+        emitToFarm(farmId, 'ai:decision', {
+          deviceId: node.device_id, irrigate: rec.irrigate, duration_s: rec.duration_s,
+          why: rec.why, agree: rec.agree, trust_score: rec.trust_score,
+          trust_reasons: rec.trust_reasons, modelVersion: rec.modelVersion,
+          inputs: rec.inputs, ts: rec.ts,
+        });
+      }
+    } catch (e) { logger.warn(`edgeAi evaluate failed: ${e.message}`); }
+
     // Push real-time sensor data to dashboard
     emitToFarm(farmId, 'sensor:data', {
       nodeId:            node._id,
@@ -111,6 +141,11 @@ module.exports = async function handleTelemetry(farmId, nodeDeviceId, payload) {
       battery_time_min:  timeMin,
       rssi,
       seq,
+      // Resilience mode (unified firmware only)
+      ...(sysMode != null ? { sys_mode: sysMode } : {}),
+      ...(aiFlag  != null ? { ai_flag:  aiFlag  } : {}),
+      // Shadow AI verdict + sensor trust (AI Brain layer)
+      ...(ai ? { ai_dec: ai.dec, ai_trust: ai.trust } : {}),
       // Sleep duty-cycle timing (omitted when the node isn't duty-cycling).
       ...(slpOn  != null ? { slp_on:  slpOn  } : {}),
       ...(slpAwk != null ? { slp_awk: slpAwk } : {}),

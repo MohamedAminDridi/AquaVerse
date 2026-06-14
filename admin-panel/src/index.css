@@ -2,12 +2,152 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  --color-brand: #1d6d4e;
+/* ─────────────────────────────────────────────────────────────────────────────
+   AquaVerse OS — design tokens. Dark is home; `.light` on <html> flips it.
+   Components use var(--*) so a single token set themes the whole app.
+   ───────────────────────────────────────────────────────────────────────────── */
+:root, html.dark {
+  --bg:        #06090f;   /* deep space base */
+  --bg-2:      #0a101b;   /* secondary surface */
+  --panel:     rgba(18, 26, 40, 0.66);   /* glass panel fill */
+  --panel-2:   rgba(12, 18, 30, 0.72);
+  --border:    rgba(120, 160, 200, 0.16);
+  --border-2:  rgba(120, 160, 200, 0.28);
+  --text:      #e6eefb;
+  --text-dim:  #8aa0bd;
+  --text-mute: #5b6b82;
+  --accent:    #22d3ee;   /* live aqua */
+  --accent-2:  #0891b2;
+  --grid:      rgba(80, 130, 180, 0.07);
+  --shadow:    rgba(0, 0, 0, 0.5);
+}
+html.light {
+  --bg:        #eef2f7;
+  --bg-2:      #e3e9f1;
+  --panel:     rgba(255, 255, 255, 0.82);
+  --panel-2:   rgba(255, 255, 255, 0.9);
+  --border:    rgba(20, 40, 70, 0.12);
+  --border-2:  rgba(20, 40, 70, 0.2);
+  --text:      #0f1b2d;
+  --text-dim:  #475569;
+  --text-mute: #94a3b8;
+  --accent:    #0891b2;
+  --accent-2:  #0e7490;
+  --grid:      rgba(20, 60, 110, 0.06);
+  --shadow:    rgba(30, 50, 90, 0.12);
 }
 
+html, body, #root { height: 100%; }
 body {
   font-family: Inter, system-ui, sans-serif;
-  background: #f9fafb;
-  color: #111827;
+  background: var(--bg);
+  color: var(--text);
+  transition: background .4s ease, color .4s ease;
 }
+
+/* faint mission-control grid + radial glow behind everything */
+.os-backdrop {
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background:
+    radial-gradient(1100px 700px at 78% -8%, rgba(34,211,238,0.10), transparent 60%),
+    radial-gradient(900px 600px at 10% 110%, rgba(16,185,129,0.07), transparent 55%),
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 100% 100%, 100% 100%, 44px 44px, 44px 44px;
+}
+
+/* glass panel */
+.os-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  backdrop-filter: blur(14px);
+  box-shadow: 0 10px 40px -16px var(--shadow);
+}
+.os-panel-hover { transition: border-color .2s, transform .2s, box-shadow .2s; }
+.os-panel-hover:hover { border-color: var(--border-2); transform: translateY(-2px); box-shadow: 0 16px 44px -16px var(--shadow); }
+
+.mono { font-family: 'JetBrains Mono', ui-monospace, monospace; font-feature-settings: 'tnum'; }
+.text-dim { color: var(--text-dim); }
+.text-mute { color: var(--text-mute); }
+
+/* animated scanline sweep (panels, on mount) */
+@keyframes os-scan { 0% { transform: translateY(-100%); opacity: 0; } 30% { opacity: .5; } 100% { transform: translateY(220%); opacity: 0; } }
+.os-scan::after {
+  content: ''; position: absolute; left: 0; right: 0; top: 0; height: 32%;
+  background: linear-gradient(180deg, transparent, rgba(34,211,238,0.10), transparent);
+  animation: os-scan 2.6s ease-in-out infinite; pointer-events: none;
+}
+
+/* soft pulse for live status dots */
+@keyframes os-pulse { 0%,100% { opacity: 1; box-shadow: 0 0 0 0 currentColor; } 50% { opacity: .55; box-shadow: 0 0 0 4px transparent; } }
+.os-live { animation: os-pulse 1.8s ease-in-out infinite; }
+
+/* thin custom scrollbars */
+*::-webkit-scrollbar { width: 9px; height: 9px; }
+*::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   Dark compatibility layer — retones the legacy light-theme admin pages (Farms,
+   Gateways, Nodes, Alerts, Analytics, Users, OTA, Settings) into AquaVerse OS
+   without touching each file. Scoped to `main.app-pages`, so the redesigned
+   Dashboard (uses os-panel) and the 3D Twin route are unaffected. Only active in
+   dark mode — light mode shows the original styling.
+   ───────────────────────────────────────────────────────────────────────────── */
+html.dark main.app-pages {
+  --b: var(--border);
+}
+html.dark main.app-pages .bg-white { background: var(--panel) !important; backdrop-filter: blur(10px); }
+html.dark main.app-pages .bg-gray-50,
+html.dark main.app-pages .bg-gray-100 { background: var(--panel-2) !important; }
+html.dark main.app-pages .bg-slate-50,
+html.dark main.app-pages .bg-slate-100 { background: var(--panel-2) !important; }
+
+html.dark main.app-pages .text-gray-900,
+html.dark main.app-pages .text-gray-800,
+html.dark main.app-pages .text-slate-900,
+html.dark main.app-pages .text-slate-800,
+html.dark main.app-pages .text-black { color: var(--text) !important; }
+html.dark main.app-pages .text-gray-700,
+html.dark main.app-pages .text-gray-600,
+html.dark main.app-pages .text-gray-500,
+html.dark main.app-pages .text-slate-700,
+html.dark main.app-pages .text-slate-600,
+html.dark main.app-pages .text-slate-500 { color: var(--text-dim) !important; }
+html.dark main.app-pages .text-gray-400,
+html.dark main.app-pages .text-gray-300,
+html.dark main.app-pages .text-slate-400,
+html.dark main.app-pages .text-slate-300 { color: var(--text-mute) !important; }
+
+html.dark main.app-pages .border,
+html.dark main.app-pages [class*="border-gray-"],
+html.dark main.app-pages [class*="border-slate-"],
+html.dark main.app-pages [class*="divide-gray-"] > * + *,
+html.dark main.app-pages [class*="divide-slate-"] > * + * { border-color: var(--border) !important; }
+
+html.dark main.app-pages .hover\:bg-gray-50:hover,
+html.dark main.app-pages .hover\:bg-gray-100:hover,
+html.dark main.app-pages .hover\:bg-slate-50:hover,
+html.dark main.app-pages .hover\:bg-slate-100:hover { background: var(--panel) !important; }
+
+/* form controls */
+html.dark main.app-pages input,
+html.dark main.app-pages select,
+html.dark main.app-pages textarea {
+  background: var(--panel-2) !important;
+  color: var(--text) !important;
+  border-color: var(--border) !important;
+}
+html.dark main.app-pages input::placeholder,
+html.dark main.app-pages textarea::placeholder { color: var(--text-mute) !important; }
+
+/* soften the pastel status chips so they glow instead of washing out on dark */
+html.dark main.app-pages .bg-green-50,  html.dark main.app-pages .bg-emerald-50  { background: rgba(52,211,153,0.14) !important; }
+html.dark main.app-pages .bg-red-50,    html.dark main.app-pages .bg-rose-50     { background: rgba(248,113,113,0.14) !important; }
+html.dark main.app-pages .bg-yellow-50, html.dark main.app-pages .bg-amber-50    { background: rgba(251,191,36,0.14) !important; }
+html.dark main.app-pages .bg-blue-50,   html.dark main.app-pages .bg-indigo-50   { background: rgba(34,211,238,0.14) !important; }
+html.dark main.app-pages .bg-green-100  { background: rgba(52,211,153,0.18) !important; }
+html.dark main.app-pages .bg-red-100    { background: rgba(248,113,113,0.18) !important; }
+html.dark main.app-pages .bg-yellow-100 { background: rgba(251,191,36,0.18) !important; }
+html.dark main.app-pages .bg-blue-100   { background: rgba(34,211,238,0.18) !important; }

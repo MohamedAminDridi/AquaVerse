@@ -34,6 +34,11 @@ export function useTwinTelemetry(farmId) {
       ...(d.pump_state != null || d.pump != null
         ? { pump: d.pump_state ?? d.pump }
         : {}),
+      // Resilience mode + AI Brain layer (shadow verdicts, sensor trust)
+      ...(d.sys_mode != null ? { sysMode: d.sys_mode } : {}),
+      ...(d.ai_flag  != null ? { aiFlag:  d.ai_flag  } : {}),
+      ...(d.ai_dec   != null ? { aiDec:   d.ai_dec   } : {}),
+      ...(d.ai_trust != null ? { aiTrust: d.ai_trust } : {}),
       // Real duty-cycle timing from the node (LoRa). slpStamp marks when slpUp
       // was measured so the countdown can extrapolate from the device clock.
       ...(d.slp_on  != null ? { slpOn: d.slp_on, slpStamp: Date.now() } : {}),
@@ -41,6 +46,8 @@ export function useTwinTelemetry(farmId) {
       ...(d.slp_nap != null ? { slpNap: d.slp_nap } : {}),
       ...(d.slp_up  != null ? { slpUp:  d.slp_up  } : {}),
     }); },
+    // Shadow AI decision changed for a node → feed the AI Brain ledger live.
+    'ai:decision': (d) => useTwinStore.getState().addAiDecision(d),
     'node:status': (d) => apply(d.device_id ?? d.deviceId, {
       status: d.status,
       valve:  d.valve ?? d.valve_state,

@@ -220,6 +220,28 @@ exports.startJobs = () => {
     logger.info(`Keep-alive ping armed → ${url} (every 10 min)`);
   }
 
+  // ── System heartbeat (resilience layer, Phase 1) ────────────────────
+  // Every 10 s, publish a sequence-numbered beacon per farm on
+  // farms/{farmId}/system/heartbeat. The gateway relays it over LoRa as a
+  // binary HEARTBEAT frame; nodes that miss 3 consecutive beacons switch to
+  // AUTONOMOUS mode. The beacon also carries the dashboard's edge-AI switch,
+  // so flipping it reaches every node within one beacon period.
+  let hbSeq = 0;
+  setInterval(async () => {
+    try {
+      const Farm = require('../models/Farm.model');
+      const SystemSetting = require('../models/SystemSetting.model');
+      const { publish } = require('../mqtt/mqttClient');
+      const ai = await SystemSetting.findOne({ key: 'ai' }).lean();
+      const farms = await Farm.find().select('_id').lean();
+      hbSeq = (hbSeq + 1) >>> 0;
+      for (const f of farms) {
+        publish(`farms/${f._id}/system/heartbeat`,
+          { seq: hbSeq, ai: ai?.aiEnabled ? 1 : 0, ts: Date.now() }, { qos: 0 });
+      }
+    } catch (e) { logger.warn(`Heartbeat publish failed: ${e.message}`); }
+  }, 10000);
+
   // ── Daily summary log ──────────────────────────────────────────────
   cron.schedule('0 0 * * *', () => {
     logger.info('Daily cron: system summary logged');

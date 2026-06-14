@@ -61,12 +61,19 @@ export const useTwinStore = create((set, get) => ({
   // Deep-sleep config per node (device_id → { enabled, intervalMin, daily, startTime, wakeTime, state }).
   // Populated by the Sleep layer's scheduler; read by the 3D sleep tags.
   sleepCfg: {},
+  // ── AI Brain layer ──────────────────────────────────────────────────────
+  aiEnabled: null,        // global edge-AI switch (null = not loaded yet)
+  aiDecisions: [],        // newest-first ring of shadow DECISION records (≤100)
+  // What-if lens: when active, verdict chips show what the model WOULD decide
+  // under these simulated conditions instead of live data.
+  whatIf: { active: false, soil: 30, temp: 25, hum: 60 },
   // Master feature switches for the 3D twin (toggled from the settings gear).
   // Deeply-nested components (crops/energy inside nodes) read these directly.
   features: {
     weather: true, crops: true, pipes: true, energy: true,
     labels: true, ground: true, signal: false,   // signal = Electromagnetic / Signal Spectrum mode
     innerPipes: false,   // per-node internal pipeline architecture (off by default; always shown in the Water layer)
+    scenery: true,       // procedural environment: mountains, forest, lake, birds, fog
   },
   // "Two Worlds": digital = the invisible intelligence layer is revealed.
   // digitalLayer selects which hidden system: comms | water | ai | climate |
@@ -91,6 +98,7 @@ export const useTwinStore = create((set, get) => ({
   layers:  { links: true, labels: true, grid: true },  // toggled visibility
   colorBy: 'status', // 'status' | 'zone'  — what drives the plot fill colour
   topDown: false,    // orthographic top-down "map" view
+  walk:    false,    // first-person walk mode (WASD + mouse-look, eye height)
   focus:   null,     // fly-to request { key, ts }  (ts retriggers same-key flights)
 
   // playback (24h replay) — frames: [{ ts, byId: { [deviceId]: { soil, temp, hum, bat } } }]
@@ -177,6 +185,7 @@ export const useTwinStore = create((set, get) => ({
   toggleLayer: (name) => set((s) => ({ layers: { ...s.layers, [name]: !s.layers[name] } })),
   setColorBy:  (v)    => set({ colorBy: v }),
   setTopDown:  (v)    => set({ topDown: v }),
+  setWalk:     (v)    => set({ walk: v }),
   requestFocus:(key)  => set({ focus: { key, ts: Date.now() } }),
 
   // playback
@@ -187,6 +196,10 @@ export const useTwinStore = create((set, get) => ({
   setForecast:      (f) => set({ forecast: Array.isArray(f) ? f : [] }),
   setFutureDay:     (n) => set({ futureDay: n }),
   setSleepCfg: (deviceId, cfg) => set((s) => (deviceId ? { sleepCfg: { ...s.sleepCfg, [deviceId]: cfg } } : {})),
+  setAiEnabled: (v) => set({ aiEnabled: v }),
+  addAiDecision: (d) => set((s) => ({ aiDecisions: [d, ...s.aiDecisions].slice(0, 100) })),
+  setAiDecisions: (list) => set({ aiDecisions: Array.isArray(list) ? list.slice(0, 100) : [] }),
+  setWhatIf: (patch) => set((s) => ({ whatIf: { ...s.whatIf, ...patch } })),
   setFeature:    (k, v) => set((s) => ({ features: { ...s.features, [k]: v } })),
   toggleFeature: (k)    => set((s) => ({ features: { ...s.features, [k]: !s.features[k] } })),
   setDigital:      (v)  => set({ digital: v }),

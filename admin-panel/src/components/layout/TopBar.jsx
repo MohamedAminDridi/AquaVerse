@@ -1,43 +1,58 @@
 import { useAuthStore }  from '../../store/authStore';
 import { useAlertStore }  from '../../store/alertStore';
+import { useUiStore }     from '../../store/uiStore';
 import { useNavigate, Link } from 'react-router-dom';
 
 export default function TopBar({ navOpen = true, onToggleNav }) {
   const { user, logout } = useAuthStore();
   const unreadCount      = useAlertStore(s => s.unreadCount);
+  const theme            = useUiStore(s => s.theme);
+  const toggleTheme      = useUiStore(s => s.toggleTheme);
   const nav = useNavigate();
 
   const handleLogout = () => { logout(); nav('/login'); };
+  const iconBtn = 'w-9 h-9 grid place-items-center rounded-lg text-lg leading-none transition-colors';
 
   return (
-    <header className="bg-white border-b border-gray-200 px-6 py-3 flex items-center justify-between">
-      <button
-        onClick={onToggleNav}
-        title={navOpen ? 'Hide menu' : 'Show menu'}
-        aria-label={navOpen ? 'Hide menu' : 'Show menu'}
-        className="text-gray-500 hover:text-gray-800 hover:bg-gray-100 transition-colors
-                   w-9 h-9 -ml-1.5 grid place-items-center rounded-lg text-xl leading-none"
-      >
-        {navOpen ? '⮜' : '☰'}
-      </button>
-      <div className="flex items-center gap-4">
+    <header className="relative z-10 px-5 py-2.5 flex items-center justify-between"
+      style={{ background: 'var(--panel-2)', borderBottom: '1px solid var(--border)', backdropFilter: 'blur(14px)' }}>
+      <div className="flex items-center gap-3">
+        <button onClick={onToggleNav} title={navOpen ? 'Hide menu' : 'Show menu'} className={iconBtn}
+          style={{ color: 'var(--text-dim)' }}>{navOpen ? '⮜' : '☰'}</button>
+        <div className="hidden sm:flex items-center gap-2 text-[11px] mono text-mute">
+          <span className="w-1.5 h-1.5 rounded-full os-live" style={{ background: '#34d399', color: '#34d399' }} />
+          SYSTEM ONLINE
+        </div>
+      </div>
 
-        {/* Bell icon with unread badge */}
-        <Link to="/alerts" className="relative text-gray-500 hover:text-gray-800 transition-colors">
-          <span className="text-xl">🔔</span>
+      <div className="flex items-center gap-2">
+        {/* theme toggle */}
+        <button onClick={toggleTheme} title="Toggle theme" className={iconBtn}
+          style={{ color: 'var(--text-dim)', background: 'var(--panel)' }}>
+          {theme === 'dark' ? '☀️' : '🌙'}
+        </button>
+
+        {/* alerts */}
+        <Link to="/alerts" className={`relative ${iconBtn}`} style={{ color: 'var(--text-dim)', background: 'var(--panel)' }}>
+          <span>🔔</span>
           {unreadCount > 0 && (
-            <span className="absolute -top-1.5 -right-1.5 bg-red-500 text-white
-                             text-[10px] font-bold px-1 rounded-full min-w-[1rem]
-                             text-center leading-tight">
+            <span className="absolute -top-1 -right-1 text-white text-[9px] font-bold px-1 rounded-full min-w-[15px] text-center leading-tight"
+              style={{ background: '#ef4444', boxShadow: '0 0 8px rgba(239,68,68,0.6)' }}>
               {unreadCount > 99 ? '99+' : unreadCount}
             </span>
           )}
         </Link>
 
-        <span className="text-sm text-gray-600">{user?.name || 'Admin'}</span>
+        <div className="flex items-center gap-2 pl-1">
+          <div className="w-7 h-7 rounded-full grid place-items-center text-[11px] font-bold"
+            style={{ background: 'rgba(34,211,238,0.15)', color: 'var(--accent)', border: '1px solid var(--border-2)' }}>
+            {(user?.name || 'A').charAt(0).toUpperCase()}
+          </div>
+          <span className="text-sm hidden md:block" style={{ color: 'var(--text-dim)' }}>{user?.name || 'Admin'}</span>
+        </div>
         <button onClick={handleLogout}
-          className="text-xs text-gray-500 hover:text-red-600 border border-gray-200
-                     px-3 py-1.5 rounded-lg transition-colors">
+          className="text-xs px-3 py-1.5 rounded-lg transition-colors"
+          style={{ color: 'var(--text-dim)', border: '1px solid var(--border)' }}>
           Logout
         </button>
       </div>

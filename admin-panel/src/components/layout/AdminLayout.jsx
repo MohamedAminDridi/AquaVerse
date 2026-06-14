@@ -1,4 +1,4 @@
-import { Outlet }       from 'react-router-dom';
+import { Outlet, useLocation } from 'react-router-dom';
 import { useEffect, useRef, useState } from 'react';
 import { io }           from 'socket.io-client';
 import Sidebar          from './Sidebar';
@@ -46,6 +46,10 @@ export default function AdminLayout() {
   const { setUnreadCount, incrementUnread,
           addToast, toasts, removeToast }           = useAlertStore();
   const socketRef = useRef(null);
+  const { pathname } = useLocation();
+  // The 3D twin manages its own styling; everything else gets the dark
+  // compatibility layer (see index.css `main.app-pages`).
+  const isTwin = pathname.startsWith('/twin');
 
   // Collapsible nav sidebar (persists across reloads). Lets the 3D twin (and any
   // wide page) use the full window width.
@@ -94,11 +98,13 @@ export default function AdminLayout() {
   }, [token]);
 
   return (
-    <div className="flex h-screen overflow-hidden bg-gray-50">
+    <div className="flex h-screen overflow-hidden" style={{ background: 'var(--bg)' }}>
+      {/* mission-control grid + glow behind everything */}
+      <div className="os-backdrop" />
       {navOpen && <Sidebar />}
-      <div className="flex flex-col flex-1 overflow-hidden">
+      <div className="relative z-10 flex flex-col flex-1 overflow-hidden">
         <TopBar navOpen={navOpen} onToggleNav={toggleNav} />
-        <main className="flex-1 overflow-y-auto p-6">
+        <main className={`flex-1 overflow-y-auto p-6 ${isTwin ? '' : 'app-pages'}`}>
           <Outlet />
         </main>
       </div>

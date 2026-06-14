@@ -15,6 +15,7 @@ import * as THREE from 'three';
 import api from '../services/api';
 import { useTwinStore } from '../store/twinStore';
 import { useTwinTelemetry } from '../hooks/useTwinTelemetry';
+import Scenery from '../components/twin/Scenery';
 
 /* ------------------------------------------------------------------ helpers */
 const GW_PALETTE = ['#2563eb', '#16a34a', '#db2777', '#d97706', '#7c3aed', '#0891b2', '#dc2626', '#4f46e5'];
@@ -201,6 +202,9 @@ const PIPE_UP = new THREE.Vector3(0, 1, 0);
 //   cloud: 0…1 overcast   wet: 0…1 ground wetness   windX/windZ: drift vector
 //   digital: 0 (physical world) … 1 (digital/cyber layer) — eased transition
 const ENV = { night: 0, sun: 1, cloud: 0, wet: 0, windX: 0.4, windZ: 0.2, windSpeed: 0.1, digital: 0 };
+// Expose the live ENV to extracted twin modules (components/twin/*) — same
+// object reference, so their useFrame loops read it with zero re-renders.
+if (typeof window !== 'undefined') window.__twinEnv = ENV;
 
 // The intelligence layers of the digital world (each has an accent + identity).
 const LAYER_THEME = {
@@ -1598,12 +1602,28 @@ function CinematicDirector({ controlsRef, scene, cinematic, editMode }) {
   const gTgt = useMemo(() => new THREE.Vector3(), []);
   const C = useMemo(() => new THREE.Vector3(), []);
 
-  // intro fly-in (runs once on mount)
+  const saveTimer = useRef(0);
+
+  // intro fly-in (runs once on mount) — UNLESS a saved view exists, in which
+  // case we restore the camera exactly where it was left and skip the fly-in.
   useEffect(() => {
-    camera.position.set(72, 58, 72);
-    goal.current = { pos: new THREE.Vector3(24, 20, 26), tgt: new THREE.Vector3(0, 1, 0) };
-    mode.current = 'intro';
-  }, [camera]);
+    let restored = false;
+    try {
+      const v = JSON.parse(localStorage.getItem('av_twin_view') || 'null');
+      if (v && v.pos && v.tgt) {
+        camera.position.set(v.pos[0], v.pos[1], v.pos[2]);
+        const c = controlsRef.current;
+        if (c) { c.target.set(v.tgt[0], v.tgt[1], v.tgt[2]); c.update(); }
+        mode.current = 'idle';
+        restored = true;
+      }
+    } catch { /* ignore corrupt view */ }
+    if (!restored) {
+      camera.position.set(72, 58, 72);
+      goal.current = { pos: new THREE.Vector3(24, 20, 26), tgt: new THREE.Vector3(0, 1, 0) };
+      mode.current = 'intro';
+    }
+  }, [camera, controlsRef]);
 
   // push-in to the clicked device (when NOT in cinematic)
   useEffect(() => {
@@ -1663,6 +1683,21 @@ function CinematicDirector({ controlsRef, scene, cinematic, editMode }) {
       c.update();
       const done = camera.position.distanceTo(goal.current.pos) < (mode.current === 'intro' ? 0.6 : 0.1);
       if (done) { goal.current = null; mode.current = 'idle'; c.enabled = true; }
+      return;
+    }
+
+    // Idle (user driving the orbit) — persist the view ~once/sec so a refresh
+    // or revisit reopens exactly where you left off.
+    saveTimer.current += dt;
+    if (saveTimer.current > 1) {
+      saveTimer.current = 0;
+      const p = camera.position, t = c.target;
+      try {
+        localStorage.setItem('av_twin_view', JSON.stringify({
+          pos: [+p.x.toFixed(2), +p.y.toFixed(2), +p.z.toFixed(2)],
+          tgt: [+t.x.toFixed(2), +t.y.toFixed(2), +t.z.toFixed(2)],
+        }));
+      } catch { /* quota */ }
     }
   });
   return null;
@@ -2122,28 +2157,36 @@ function PlanetarySky({ clock }) {
     const digOk = ENV.digital < 0.5;
 
     // ── sun: a bright core + two soft additive halos (fakes bloom) ──
+    // Positioned BEYOND the mountain ring (r≈300 > peaks at r≈215) so the depth
+    // buffer lets the mountains occlude it: at dawn/dusk it's hidden behind the
+    // peaks and emerges from behind the skyline as it climbs (sy 8 at horizon →
+    // high at noon, peaks are ~30 tall). Scales ×3.3 to keep apparent size at
+    // the larger distance; sprite materials use fog:false so distance doesn't dim it.
     const sunVis = e > -0.06 && digOk;
-    const sx = Math.cos(az) * 90, sy = Math.max(e, -0.06) * 82 + 5, sz = 34;
+    const F = 3.3;
+    const sx = Math.cos(az) * 300, sy = Math.max(e, -0.06) * 250 + 8, sz = Math.sin(az) * 60 + 110;
     [sunRef, sg1, sg2].forEach((r) => { if (r.current) { r.current.visible = sunVis; r.current.position.set(sx, sy, sz); } });
     if (sunRef.current) sunRef.current.material.opacity = sunVis ? 1 : 0;
-    if (sg1.current) { const s = 16 + (1 - up) * 12; sg1.current.scale.set(s, s, s); sg1.current.material.opacity = 0.45 + up * 0.45; }
-    if (sg2.current) { const s = 30 + (1 - up) * 18; sg2.current.scale.set(s, s, s); sg2.current.material.opacity = 0.2 + up * 0.18; }
+    if (sg1.current) { const s = (16 + (1 - up) * 12) * F; sg1.current.scale.set(s, s, s); sg1.current.material.opacity = 0.45 + up * 0.45; }
+    if (sg2.current) { const s = (30 + (1 - up) * 18) * F; sg2.current.scale.set(s, s, s); sg2.current.material.opacity = 0.2 + up * 0.18; }
 
-    // ── moon: phase disc + soft halo, opposite the sun ──
+    // ── moon: phase disc + soft halo, opposite the sun (also occluded by peaks) ──
     const mh = h + 12, me = sunElevation(mh), maz = ((mh - 6) / 12) * Math.PI;
     const illum = moonIllum(moonPhase(Date.now()));
     const moonVis = ENV.night > 0.03 && digOk;
-    const mx = Math.cos(maz) * 72, my = Math.max(me, -0.12) * 54 + 14, mz = 26;
+    const mx = Math.cos(maz) * 280, my = Math.max(me, -0.12) * 190 + 18, mz = Math.sin(maz) * 50 + 100;
     if (moonRef.current) { moonRef.current.visible = moonVis; moonRef.current.position.set(mx, my, mz); moonRef.current.material.opacity = Math.min(1, ENV.night * 1.5); }
-    if (mGlow.current) { mGlow.current.visible = moonVis; mGlow.current.position.set(mx, my, mz); mGlow.current.material.opacity = ENV.night * (0.1 + illum * 0.32); const s = 11 + illum * 5; mGlow.current.scale.set(s, s, s); }
+    if (mGlow.current) { mGlow.current.visible = moonVis; mGlow.current.position.set(mx, my, mz); mGlow.current.material.opacity = ENV.night * (0.1 + illum * 0.32); const s = (11 + illum * 5) * 3; mGlow.current.scale.set(s, s, s); }
   });
   return (
     <>
-      <sprite ref={sg2}><spriteMaterial map={SUN_TEX} color="#ffcf8a" transparent opacity={0} depthWrite={false} blending={THREE.AdditiveBlending} /></sprite>
-      <sprite ref={sg1}><spriteMaterial map={SUN_TEX} color="#fff0c8" transparent opacity={0} depthWrite={false} blending={THREE.AdditiveBlending} /></sprite>
-      <sprite ref={sunRef} scale={[7, 7, 7]}><spriteMaterial map={SUN_TEX} color="#fffaf0" transparent opacity={0} depthWrite={false} blending={THREE.AdditiveBlending} /></sprite>
-      <sprite ref={mGlow}><spriteMaterial map={GLOW_TEX} color="#cfe0ff" transparent opacity={0} depthWrite={false} blending={THREE.AdditiveBlending} /></sprite>
-      <sprite ref={moonRef} scale={[8, 8, 8]}><spriteMaterial map={MOON_TEX} transparent opacity={0} depthWrite={false} /></sprite>
+      {/* depthWrite off (don't block other transparents) but depthTest ON (default)
+          so mountains occlude them; fog off so the far distance keeps them bright. */}
+      <sprite ref={sg2} scale={[24, 24, 24]}><spriteMaterial map={SUN_TEX} color="#ffcf8a" transparent opacity={0} depthWrite={false} fog={false} blending={THREE.AdditiveBlending} /></sprite>
+      <sprite ref={sg1} scale={[24, 24, 24]}><spriteMaterial map={SUN_TEX} color="#fff0c8" transparent opacity={0} depthWrite={false} fog={false} blending={THREE.AdditiveBlending} /></sprite>
+      <sprite ref={sunRef} scale={[23, 23, 23]}><spriteMaterial map={SUN_TEX} color="#fffaf0" transparent opacity={0} depthWrite={false} fog={false} blending={THREE.AdditiveBlending} /></sprite>
+      <sprite ref={mGlow} scale={[33, 33, 33]}><spriteMaterial map={GLOW_TEX} color="#cfe0ff" transparent opacity={0} depthWrite={false} fog={false} blending={THREE.AdditiveBlending} /></sprite>
+      <sprite ref={moonRef} scale={[24, 24, 24]}><spriteMaterial map={MOON_TEX} transparent opacity={0} depthWrite={false} fog={false} /></sprite>
     </>
   );
 }
@@ -2264,14 +2307,36 @@ function DigitalController({ active }) {
   );
 }
 
-// LAYER · AI BRAIN — a neural web over the farm with a pulsing core + data pulses.
+// Mirror of the backend's v0 shadow rules (services/edgeAi.service.js) — used
+// by the What-If lens to preview decisions client-side. Must stay in sync.
+function aiShadowDecide(soil, temp, hum, hour) {
+  if (soil == null)            return { irr: false, why: 'no-soil' };
+  if (soil >= 35)              return { irr: false, why: 'soil-ok' };
+  if (hour >= 11 && hour < 16) return { irr: false, why: 'midday-skip' };
+  return { irr: true, dur: Math.min(600, Math.max(60, Math.round((35 - soil) * 12))), why: 'soil-low' };
+}
+const trustColor = (s) => (s == null ? '#94a3b8' : s >= 0.7 ? '#22c55e' : s >= 0.5 ? '#eab308' : '#ef4444');
+
+// LAYER · AI BRAIN — the window into the real edge AI. The core reflects the
+// actual Edge-AI switch (grey OFF / purple ON / amber when any node is
+// AUTONOMOUS); edges re-route to autonomous nodes ("the brain moved to the
+// edge"); the label carries the live shadow-agreement %.
 function AiNeural({ scene }) {
   const positions = useTwinStore((s) => s.positions);
+  const aiOn      = useTwinStore((s) => s.aiEnabled);
+  const byId      = useTwinStore((s) => s.byId);
+  const decisions = useTwinStore((s) => s.aiDecisions);
   const { nodeIds, gwIds, links } = scene;
   const brainRef = useRef();
   const ringRefs = useRef([]);
   const pulseRefs = useRef([]);
-  const AI = '#a855f7';
+
+  const autoIds = nodeIds.filter((id) => byId[id]?.sysMode === 1);
+  const anyAuto = autoIds.length > 0;
+  const AI = anyAuto ? '#f59e0b' : aiOn ? '#a855f7' : '#64748b';
+  const judged = decisions.filter((d) => d.agree != null).slice(0, 20);
+  const agreePct = judged.length ? Math.round((judged.filter((d) => d.agree).length / judged.length) * 100) : null;
+
   const center = useMemo(() => {
     let x = 0, z = 0, n = 0;
     [...nodeIds, ...gwIds].forEach((id) => { const p = positions[id]; if (p) { x += p[0]; z += p[2]; n++; } });
@@ -2284,29 +2349,44 @@ function AiNeural({ scene }) {
       if (a && b) e.push({ a: [a[0], gwSet.has(l.fromKey) ? 2.2 : 1.66, a[2]], b: [b[0], gwSet.has(l.toKey) ? 2.2 : 1.66, b[2]] });
     });
     gwIds.forEach((id) => { const p = positions[id]; if (p) e.push({ a: center, b: [p[0], 2.25, p[2]], brain: true }); });
+    // AUTONOMOUS: the brain links straight to the deciding nodes.
+    autoIds.forEach((id) => { const p = positions[id]; if (p) e.push({ a: center, b: [p[0], 1.7, p[2]], brain: true, auto: true }); });
     return e;
-  }, [positions, links, gwIds, center]);
+  }, [positions, links, gwIds, center, autoIds.join(',')]);
+
   useFrame((_, dt) => {
     const t = performance.now() * 0.001, vis = ENV.digital > 0.05, d = ENV.digital;
+    const dim = aiOn ? 1 : 0.35;                 // switch OFF → the brain idles dim
     if (brainRef.current) {
       brainRef.current.visible = vis;
-      const s = 1 + Math.sin(t * 2) * 0.12;
+      const s = 1 + Math.sin(t * (aiOn ? 2 : 0.6)) * (aiOn ? 0.12 : 0.04);
       brainRef.current.scale.set(s, s, s);
-      brainRef.current.rotation.y += dt * 0.4;
-      brainRef.current.material.emissiveIntensity = (0.6 + Math.sin(t * 3) * 0.3) * d;
+      brainRef.current.rotation.y += dt * (aiOn ? 0.4 : 0.08);
+      brainRef.current.material.color.set(AI);
+      brainRef.current.material.emissive.set(AI);
+      brainRef.current.material.emissiveIntensity = (0.6 + Math.sin(t * 3) * 0.3) * d * dim;
     }
-    ringRefs.current.forEach((m, i) => { if (!m) return; const p = ((t * 0.3) + i / 3) % 1; const r = 1 + p * 8; m.scale.set(r, r, r); m.material.opacity = (1 - p) * 0.4 * d; });
+    ringRefs.current.forEach((m, i) => { if (!m) return; const p = ((t * 0.3) + i / 3) % 1; const r = 1 + p * 8; m.scale.set(r, r, r); m.material.color.set(AI); m.material.opacity = (1 - p) * 0.4 * d * dim; });
+    // Beacon pulse: one wave every 10 s (the real heartbeat period) brain→edges.
     pulseRefs.current.forEach((m, i) => {
       const e = edges[i]; if (!m || !e) { if (m) m.visible = false; return; }
-      m.visible = vis;
-      const tt = ((t * 0.4) + i * 0.13) % 1;
+      m.visible = vis && aiOn !== false;
+      const tt = (((t % 10) / 10) + i * 0.13) % 1;
       m.position.set(e.a[0] + (e.b[0] - e.a[0]) * tt, e.a[1] + (e.b[1] - e.a[1]) * tt, e.a[2] + (e.b[2] - e.a[2]) * tt);
-      m.material.opacity = Math.sin(tt * Math.PI) * 0.9 * d;
+      m.material.color.set(e.auto ? '#f59e0b' : AI);
+      m.material.opacity = Math.sin(tt * Math.PI) * 0.9 * d * dim;
     });
   });
+
+  const label = anyAuto
+    ? `🧠 AUTONOMOUS · ${autoIds.length} node${autoIds.length > 1 ? 's' : ''} deciding`
+    : aiOn === false ? '🧠 AI OFF — shadow only'
+    : aiOn ? `🧠 AI ARMED${agreePct != null ? ` · shadow agreement ${agreePct}%` : ' · watching'}`
+    : '🧠 AI · loading…';
+
   return (
     <group>
-      {edges.map((e, i) => <Line key={i} points={[e.a, e.b]} color={e.brain ? '#c084fc' : AI} lineWidth={e.brain ? 1.6 : 1.1} transparent opacity={0.35} depthWrite={false} />)}
+      {edges.map((e, i) => <Line key={i} points={[e.a, e.b]} color={e.auto ? '#f59e0b' : e.brain ? '#c084fc' : AI} lineWidth={e.auto ? 2 : e.brain ? 1.6 : 1.1} transparent opacity={e.auto ? 0.6 : 0.35} depthWrite={false} />)}
       {edges.map((e, i) => (
         <sprite key={`p${i}`} ref={(el) => (pulseRefs.current[i] = el)} scale={[0.5, 0.5, 0.5]}>
           <spriteMaterial map={GLOW_TEX} color={AI} transparent opacity={0} depthWrite={false} blending={THREE.AdditiveBlending} />
@@ -2323,9 +2403,156 @@ function AiNeural({ scene }) {
         </mesh>
       ))}
       <Html position={[center[0], center[1] + 1.5, center[2]]} center distanceFactor={16} className="pointer-events-none select-none">
-        <div className="px-2 py-0.5 rounded-md bg-purple-950/80 text-purple-200 text-[10px] font-semibold whitespace-nowrap ring-1 ring-purple-400/40">🧠 AI · analysing drought risk</div>
+        <div className={`px-2 py-0.5 rounded-md text-[10px] font-semibold whitespace-nowrap ring-1 ${
+          anyAuto ? 'bg-amber-950/85 text-amber-200 ring-amber-400/50'
+                  : aiOn === false ? 'bg-slate-800/85 text-slate-300 ring-slate-500/40'
+                  : 'bg-purple-950/80 text-purple-200 ring-purple-400/40'}`}>{label}</div>
       </Html>
     </group>
+  );
+}
+
+// AI layer · per-node shadow-verdict chips + sensor-trust auras.
+// Live mode: shows the backend's real shadow decision (green = agrees with the
+// cloud, red pulse = disagrees). What-If mode: shows what the same rules WOULD
+// decide under the simulated slider conditions.
+function AiVerdictTags({ scene }) {
+  const byId   = useTwinStore((s) => s.byId);
+  const positions = useTwinStore((s) => s.positions);
+  const whatIf = useTwinStore((s) => s.whatIf);
+  return scene.nodeIds.map((id) => {
+    const p = positions[id]; if (!p) return null;
+    const dev = byId[id] || {};
+    const trust = dev.aiTrust;
+    let chip;
+    if (whatIf.active) {
+      const sim = aiShadowDecide(whatIf.soil, whatIf.temp, whatIf.hum, new Date().getHours());
+      chip = { irr: sim.irr, txt: sim.irr ? `would irrigate ${Math.round(sim.dur / 60)}m` : `hold (${sim.why})`, cls: 'bg-violet-950/85 text-violet-200 ring-violet-400/50' };
+    } else if (dev.aiDec) {
+      const d = dev.aiDec;
+      chip = {
+        irr: d.irr,
+        txt: d.irr ? `irrigate ${Math.round(d.dur / 60)}m` : `hold (${d.why})`,
+        cls: d.agree ? 'bg-emerald-950/85 text-emerald-200 ring-emerald-400/50'
+                     : 'bg-rose-950/85 text-rose-200 ring-rose-400/60 animate-pulse',
+      };
+    } else {
+      chip = { txt: 'no verdict yet', cls: 'bg-slate-800/80 text-slate-400 ring-slate-500/40' };
+    }
+    return (
+      <group key={id} position={[p[0], 0, p[2]]}>
+        {/* trust aura ring around the plot */}
+        <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, 0.24, 0]}>
+          <ringGeometry args={[1.55, 1.75, 48]} />
+          <meshBasicMaterial color={trustColor(trust?.score)} transparent opacity={trust && trust.score < 0.5 ? 0.85 : 0.45} side={THREE.DoubleSide} depthWrite={false} />
+        </mesh>
+        <Html position={[0, 2.75, 0]} center distanceFactor={13} className="pointer-events-none select-none">
+          <div className={`px-2 py-0.5 rounded-md text-[10px] font-semibold whitespace-nowrap ring-1 ${chip.cls}`}
+               style={{ borderBottom: `2px solid ${trustColor(trust?.score)}` }}>
+            🧠 {chip.txt}{trust && !trust.trusted ? ` · ⚠ ${trust.reasons.join(',')}` : ''}
+          </div>
+        </Html>
+      </group>
+    );
+  });
+}
+
+// AI Brain HUD — toggle (same endpoint as Settings), shadow agreement, the
+// decision ledger, and the What-If lens sliders.
+function AiHUD({ farmId }) {
+  const aiOn      = useTwinStore((s) => s.aiEnabled);
+  const setAiOn   = useTwinStore((s) => s.setAiEnabled);
+  const decisions = useTwinStore((s) => s.aiDecisions);
+  const setList   = useTwinStore((s) => s.setAiDecisions);
+  const whatIf    = useTwinStore((s) => s.whatIf);
+  const setWhatIf = useTwinStore((s) => s.setWhatIf);
+  const [busy, setBusy] = useState(false);
+  const [agreePct, setAgreePct] = useState(null);
+
+  useEffect(() => {
+    api.get('/system/ai').then((r) => setAiOn(!!r.data?.data?.ai?.enabled)).catch(() => {});
+    if (farmId) api.get(`/ai/decisions?farmId=${farmId}`).then((r) => {
+      setList(r.data?.data?.decisions || []);
+      setAgreePct(r.data?.data?.agreePct ?? null);
+    }).catch(() => {});
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [farmId]);
+
+  const judged = decisions.filter((d) => d.agree != null);
+  const liveAgree = judged.length ? Math.round((judged.filter((d) => d.agree).length / judged.length) * 100) : agreePct;
+
+  const toggle = () => {
+    setBusy(true);
+    api.put('/system/ai', { enabled: !aiOn })
+      .then((r) => setAiOn(!!r.data?.data?.ai?.enabled))
+      .catch(() => {})
+      .finally(() => setBusy(false));
+  };
+
+  const Slider = ({ k, label, min, max, unit }) => (
+    <label className="block text-[10px] text-slate-400">
+      {label}: <span className="text-violet-300 font-semibold">{whatIf[k]}{unit}</span>
+      <input type="range" min={min} max={max} value={whatIf[k]}
+        onChange={(e) => setWhatIf({ [k]: +e.target.value })} className="w-full accent-violet-400" />
+    </label>
+  );
+
+  return (
+    <div className="absolute top-20 right-4 z-10 w-72 rounded-2xl bg-slate-900/90 backdrop-blur-md ring-1 ring-purple-400/20 shadow-2xl p-3 space-y-2.5 text-white animate-[fadeIn_.2s_ease-out]">
+      <div className="flex items-center justify-between">
+        <span className="text-[11px] font-bold tracking-wide text-purple-300">🧠 AI BRAIN</span>
+        {liveAgree != null && (
+          <span className="text-[10px] text-slate-400">shadow agreement <span className={`font-bold ${liveAgree >= 80 ? 'text-emerald-400' : 'text-amber-400'}`}>{liveAgree}%</span></span>
+        )}
+      </div>
+
+      {/* master switch — same endpoint as Settings */}
+      <div className="flex items-center justify-between rounded-lg bg-white/5 px-2.5 py-2">
+        <div>
+          <div className="text-[12px] font-semibold">{aiOn ? 'Edge AI armed' : aiOn === false ? 'Edge AI off' : 'loading…'}</div>
+          <div className="text-[9px] text-slate-400">acts only when autonomous · shadow always learning</div>
+        </div>
+        <button onClick={toggle} disabled={busy || aiOn === null}
+          className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors disabled:opacity-40 ${aiOn ? 'bg-violet-500' : 'bg-slate-600'}`}>
+          <span className={`inline-block h-4 w-4 rounded-full bg-white transform transition-transform ${aiOn ? 'translate-x-6' : 'translate-x-1'}`} />
+        </button>
+      </div>
+
+      {/* What-If lens */}
+      <div className="rounded-lg bg-white/5 px-2.5 py-2 space-y-1">
+        <div className="flex items-center justify-between">
+          <span className="text-[11px] font-semibold text-violet-300">🔮 What-If lens</span>
+          <button onClick={() => setWhatIf({ active: !whatIf.active })}
+            className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${whatIf.active ? 'bg-violet-500 text-white' : 'bg-white/10 text-slate-300'}`}>
+            {whatIf.active ? 'ON' : 'OFF'}
+          </button>
+        </div>
+        {whatIf.active && (
+          <div className="space-y-1 pt-1">
+            <Slider k="soil" label="soil" min={0} max={100} unit="%" />
+            <Slider k="temp" label="temp" min={-5} max={50} unit="°C" />
+            <Slider k="hum"  label="humidity" min={0} max={100} unit="%" />
+            <p className="text-[9px] text-slate-500">verdict chips show what the model WOULD decide under these conditions</p>
+          </div>
+        )}
+      </div>
+
+      {/* decision ledger */}
+      <div className="max-h-44 overflow-y-auto space-y-1 pr-0.5">
+        <div className="text-[10px] uppercase tracking-wide text-slate-500">decision ledger · {decisions.length}</div>
+        {decisions.length === 0 && <div className="text-[10px] text-slate-500">no shadow decisions yet — they appear as telemetry flows</div>}
+        {decisions.slice(0, 25).map((d, i) => (
+          <div key={i} className="flex items-center gap-1.5 text-[10px] rounded bg-white/5 px-1.5 py-1">
+            <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${d.agree == null ? 'bg-slate-500' : d.agree ? 'bg-emerald-400' : 'bg-rose-400'}`} />
+            <span className="text-slate-300 truncate flex-1">
+              {d.deviceId}: {d.irrigate ? `irrigate ${Math.round((d.duration_s || 0) / 60)}m` : `hold (${d.why})`}
+            </span>
+            <span className="text-slate-500 shrink-0">{d.ts ? new Date(d.ts).toLocaleTimeString().slice(0, 5) : ''}</span>
+          </div>
+        ))}
+      </div>
+      <p className="text-[9px] text-slate-500">model {decisions[0]?.modelVersion || 'v0-rules'} · shadow mode: logged &amp; compared, never acts in CLOUD mode</p>
+    </div>
   );
 }
 
@@ -2508,6 +2735,126 @@ function FuturePanel() {
 }
 
 /* ----------------------------------------------------------------- 3D scene */
+// First-person WALK mode — pointer-lock mouse-look + WASD physics at eye height,
+// the camera following the (scenery) terrain so you can stroll the valley. While
+// active it OWNS the camera; OrbitControls is disabled by the Scene. Click the
+// canvas to capture the mouse, Esc to release, "G" / the toolbar exits walk.
+const WALK_EYE = 1.7;       // eye height above ground
+const MOUSE_SENS = 0.0016;  // radians per pixel of mouse movement (lower = slower)
+const DRAG_SENS  = 0.005;   // radians per pixel when dragging (no pointer lock)
+function WalkController({ active }) {
+  const { camera, gl } = useThree();
+  const setWalk = useTwinStore((s) => s.setWalk);
+  const yaw = useRef(0), pitch = useRef(0);
+  const keys = useRef({});
+  const vel = useRef(new THREE.Vector3());
+  const locked = useRef(false);
+  const dragging = useRef(false);
+  const lastXY = useRef([0, 0]);
+  const saved = useRef(null);
+
+  // terrain height sampler — mirrors the walkable approximation of Scenery.
+  const groundY = (x, z) => {
+    const r = Math.hypot(x, z);
+    if (r < 95) return 0;
+    const m = Math.min(1, Math.max(0, (r - 95) / 120));
+    return Math.min(8, m * 6);
+  };
+
+  useEffect(() => {
+    if (!active) return;
+    const el = gl.domElement;
+    saved.current = { pos: camera.position.clone(), quat: camera.quaternion.clone() };
+    camera.position.set(0, WALK_EYE, 26);
+    yaw.current = Math.PI; pitch.current = 0;
+    camera.quaternion.setFromEuler(new THREE.Euler(0, Math.PI, 0, 'YXZ'));
+
+    const ACT = ['KeyW','KeyA','KeyS','KeyD','ArrowUp','ArrowDown','ArrowLeft','ArrowRight','ShiftLeft','ShiftRight','Space'];
+    const kd = (e) => {
+      if (e.code === 'Escape') { setWalk(false); return; }
+      if (ACT.includes(e.code)) { keys.current[e.code] = true; e.preventDefault(); }
+    };
+    const ku = (e) => { if (ACT.includes(e.code)) { keys.current[e.code] = false; e.preventDefault(); } };
+
+    // Look: works BOTH with pointer-lock (movementX) AND with click-drag, so it
+    // always responds even before/without lock. Sensitivity is gentle + clamped.
+    const applyLook = (dx, dy, sens) => {
+      yaw.current   -= dx * sens;
+      pitch.current  = Math.max(-1.35, Math.min(1.35, pitch.current - dy * sens));
+    };
+    const onMove = (e) => {
+      if (locked.current) {
+        // clamp insane single-frame deltas some browsers emit on lock
+        const dx = Math.max(-120, Math.min(120, e.movementX || 0));
+        const dy = Math.max(-120, Math.min(120, e.movementY || 0));
+        applyLook(dx, dy, MOUSE_SENS);
+      } else if (dragging.current) {
+        applyLook(e.clientX - lastXY.current[0], e.clientY - lastXY.current[1], DRAG_SENS);
+        lastXY.current = [e.clientX, e.clientY];
+      }
+    };
+    const onDown = (e) => {
+      dragging.current = true; lastXY.current = [e.clientX, e.clientY];
+      el.requestPointerLock?.();                       // try lock; drag works if it fails
+    };
+    const onUp = () => { dragging.current = false; };
+    const onLockChange = () => { locked.current = document.pointerLockElement === el; };
+
+    window.addEventListener('keydown', kd);
+    window.addEventListener('keyup', ku);
+    window.addEventListener('blur', () => { keys.current = {}; });
+    el.addEventListener('mousedown', onDown);
+    window.addEventListener('mouseup', onUp);
+    window.addEventListener('mousemove', onMove);
+    document.addEventListener('pointerlockchange', onLockChange);
+    el.style.cursor = 'none';
+    el.focus?.();
+
+    return () => {
+      window.removeEventListener('keydown', kd);
+      window.removeEventListener('keyup', ku);
+      el.removeEventListener('mousedown', onDown);
+      window.removeEventListener('mouseup', onUp);
+      window.removeEventListener('mousemove', onMove);
+      document.removeEventListener('pointerlockchange', onLockChange);
+      if (document.pointerLockElement === el) document.exitPointerLock?.();
+      el.style.cursor = '';
+      keys.current = {}; dragging.current = false;
+      if (saved.current) { camera.position.copy(saved.current.pos); camera.quaternion.copy(saved.current.quat); }
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active]);
+
+  useFrame((_, dt) => {
+    if (!active) return;
+    const step = Math.min(dt, 0.05);
+    camera.quaternion.setFromEuler(new THREE.Euler(pitch.current, yaw.current, 0, 'YXZ'));
+
+    const k = keys.current;
+    // movement basis from yaw only (stay level even when looking up/down)
+    const sin = Math.sin(yaw.current), cos = Math.cos(yaw.current);
+    let fx = 0, fz = 0;
+    if (k.KeyW || k.ArrowUp)    { fx -= sin; fz -= cos; }
+    if (k.KeyS || k.ArrowDown)  { fx += sin; fz += cos; }
+    if (k.KeyD || k.ArrowRight) { fx += cos; fz -= sin; }
+    if (k.KeyA || k.ArrowLeft)  { fx -= cos; fz += sin; }
+    const len = Math.hypot(fx, fz);
+    const speed = 7 * ((k.ShiftLeft || k.ShiftRight) ? 2.2 : 1);
+    const wishX = len ? (fx / len) * speed : 0;
+    const wishZ = len ? (fz / len) * speed : 0;
+    // smooth accel toward the wish velocity
+    const a = 1 - Math.exp(-step * 11);
+    vel.current.x += (wishX - vel.current.x) * a;
+    vel.current.z += (wishZ - vel.current.z) * a;
+    camera.position.x = Math.max(-210, Math.min(210, camera.position.x + vel.current.x * step));
+    camera.position.z = Math.max(-210, Math.min(210, camera.position.z + vel.current.z * step));
+    const targetY = groundY(camera.position.x, camera.position.z) + WALK_EYE;
+    camera.position.y += (targetY - camera.position.y) * (1 - Math.exp(-step * 9));
+  });
+
+  return null;
+}
+
 function Scene({ scene, editMode, onSelect, onCommit, clock, cinematic, onValve }) {
   const { nodeIds, gwIds, links, gwColor } = scene;
   const selectedId  = useTwinStore((s) => s.selectedId);
@@ -2517,6 +2864,7 @@ function Scene({ scene, editMode, onSelect, onCommit, clock, cinematic, onValve 
   const setPosition = useTwinStore((s) => s.setPosition);
   const setDragging = useTwinStore((s) => s.setDragging);
   const feat        = useTwinStore((s) => s.features);
+  const walk        = useTwinStore((s) => s.walk);
   // a layer shows if it's the active layer, or it's enabled inside the "All" layer
   const showL = (k) => digital && (digitalLayer === k || (digitalLayer === 'all' && allLayers[k]));
 
@@ -2571,11 +2919,15 @@ function Scene({ scene, editMode, onSelect, onCommit, clock, cinematic, onValve 
       {feat.weather && (!digital || showL('climate')) && <WeatherSystem />}
 
       {feat.ground && <Ground />}
+      {/* Procedural environment: mountain ring, pine forest, boulders, lake,
+          grass, birds + atmospheric fog (seeded — same world every visit). */}
+      {feat.scenery && <Scenery />}
       <Grid position={[0, 0.01, 0]} infiniteGrid cellSize={1} sectionSize={5} fadeDistance={95} fadeStrength={1.6} cellColor="#bcc6b2" sectionColor="#9aa888" />
 
       {(feat.pipes || showL('water')) && <PipeNetwork scene={scene} />}
       {showL('comms')      && <SignalSpectrum scene={scene} />}
       {showL('ai')         && <AiNeural scene={scene} />}
+      {showL('ai')         && <AiVerdictTags scene={scene} />}
       {showL('biology')    && <Roots scene={scene} />}
       {showL('prediction') && <PredictionGhosts scene={scene} />}
       {/* In the 🌐 "All" layer these per-node tags are folded into AllLayerHud,
@@ -2605,7 +2957,8 @@ function Scene({ scene, editMode, onSelect, onCommit, clock, cinematic, onValve 
         />
       ))}
 
-      <OrbitControls ref={controlsRef} enableDamping target={[0, 1, 0]} maxPolarAngle={Math.PI / 2.2} minDistance={8} maxDistance={100} />
+      <WalkController active={walk} />
+      <OrbitControls ref={controlsRef} enabled={!walk} enableDamping target={[0, 1, 0]} maxPolarAngle={Math.PI / 2.2} minDistance={8} maxDistance={170} />
     </>
   );
 }
@@ -3435,6 +3788,7 @@ function EnergyHUD({ nodeIds }) {
 /* ------------------------------------------------ HUD: feature settings */
 const FEATURE_LIST = [
   ['weather', '🌦️ Weather & sky'],
+  ['scenery', '🏔 Mountains & nature'],
   ['ground',  '🟫 Ground'],
   ['crops',   '🌱 Crops'],
   ['pipes',   '🚰 Pipes & flow'],
@@ -3898,6 +4252,8 @@ export default function FarmTwinPage() {
   const live         = useTwinStore((s) => s.live);
   const editMode     = useTwinStore((s) => s.editMode);
   const setEditMode  = useTwinStore((s) => s.setEditMode);
+  const walk         = useTwinStore((s) => s.walk);
+  const setWalk      = useTwinStore((s) => s.setWalk);
 
   const metaRef = useRef({}); // device_id -> { type: 'node'|'gateway', _id }
 
@@ -4167,6 +4523,7 @@ export default function FarmTwinPage() {
             <ToolButton active={wxDemo} accent="sky" onClick={() => setWxDemo((v) => !v)} title="Weather">🌦️</ToolButton>
             <ToolButton active={digital && digitalLayer === 'comms'} accent="cyan" onClick={() => (digital && digitalLayer === 'comms') ? setDigital(false) : setDigitalLayer('comms')} title="Signal spectrum (Comms layer)">📡</ToolButton>
             <ToolButton active={cinematic} accent="fuchsia" onClick={() => { setCinematic((v) => !v); select(null); if (!cinematic) setEditMode(false); }} title="Cinematic">🎬</ToolButton>
+            <ToolButton active={walk} accent="emerald" onClick={() => { const n = !walk; setWalk(n); if (n) { setCinematic(false); setEditMode(false); select(null); } }} title="Walk the farm (first person)">🚶</ToolButton>
           </div>
           <div className="flex items-center gap-1 rounded-xl bg-white/5 ring-1 ring-white/10 p-1">
             <ToolButton onClick={() => setShowSchedule(true)} title="Irrigation schedules">🗓</ToolButton>
@@ -4231,13 +4588,36 @@ export default function FarmTwinPage() {
           <div className="absolute top-16 left-1/2 -translate-x-1/2 z-30 bg-slate-900/90 text-white text-xs font-medium px-3.5 py-2 rounded-xl shadow-xl backdrop-blur animate-[fadeIn_.18s_ease-out]">{saveMsg}</div>
         )}
 
-        {!editMode && <PlanetaryPanel />}
+        {!editMode && !walk && <PlanetaryPanel />}
+
+        {/* ── First-person WALK overlay: crosshair + controls + exit ── */}
+        {walk && (
+          <>
+            <div className="absolute inset-0 z-20 pointer-events-none flex items-center justify-center">
+              <div className="w-5 h-5 rounded-full border border-white/70 shadow-[0_0_6px_rgba(0,0,0,0.6)] flex items-center justify-center">
+                <div className="w-1 h-1 rounded-full bg-white/90" />
+              </div>
+            </div>
+            <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-20 flex items-center gap-2 bg-slate-900/80 backdrop-blur text-white text-[11px] font-medium px-3.5 py-2 rounded-xl ring-1 ring-white/10 shadow-xl">
+              <span className="font-bold text-emerald-300">🚶 Walking</span>
+              <span className="text-white/40">·</span>
+              <kbd className="px-1.5 py-0.5 rounded bg-white/10 font-mono">WASD</kbd> move
+              <kbd className="px-1.5 py-0.5 rounded bg-white/10 font-mono">Shift</kbd> run
+              <kbd className="px-1.5 py-0.5 rounded bg-white/10 font-mono">Drag</kbd> look
+              <span className="text-white/40">·</span>
+              <span className="text-white/60">Esc to exit</span>
+              <button onClick={() => setWalk(false)}
+                className="pointer-events-auto ml-1 px-2 py-0.5 rounded-lg bg-rose-500/80 hover:bg-rose-500 font-semibold">Exit</button>
+            </div>
+          </>
+        )}
 
         <TimeControl clock={clock} setClock={setClock} />
         {features.weather && <WeatherPanel />}
         {digital && digitalLayer === 'comms' && <SpectrumPanel nodeIds={scene.nodeIds} />}
         {digital && digitalLayer === 'energy' && <EnergyHUD nodeIds={scene.nodeIds} />}
         {digital && digitalLayer === 'sleep' && <SleepHUD nodeIds={scene.nodeIds} />}
+        {digital && digitalLayer === 'ai' && <AiHUD farmId={farmId} />}
         {digital && digitalLayer === 'prediction' && <FuturePanel />}
         {digital && digitalLayer === 'all' && <AllLayersPanel />}
         {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
