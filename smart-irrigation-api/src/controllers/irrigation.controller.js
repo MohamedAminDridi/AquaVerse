@@ -170,9 +170,47 @@ exports.stopPump  = asyncHandler((req, res) => manualPump(req, res, 'pump_stop')
 // node just toggles its duty cycle on receipt. Commands carry an "id" so the
 // gateway forwards them over LoRa (pump-style broadcasts without "id" don't).
 // ───────────────────────────────────────────────────────────────────────────
+const sleepRetryTokens = new Map();   // device_id -> token of the active sleep loop
+
+// Re-send a sleep/wake command until the node's telemetry echoes the new state.
+// Identical in spirit to retryValveUntilEcho: the LoRa downlink is half-duplex
+// and lossy, so a single dropped packet used to leave the UI saying "Sleep
+// activated" while the node stayed awake forever. The node reports "slp" in
+// every telemetry packet, which is the only real confirmation available.
+function retrySleepUntilEcho(node, wantOn, message) {
+  const topic   = topics.command(node.farm.toString(), node.device_id);
+  const startTs = Date.now();
+  const token   = startTs + Math.random();
+  sleepRetryTokens.set(node.device_id, token);   // supersede any older loop
+  let attempts  = 0;
+
+  const tick = () => {
+    if (sleepRetryTokens.get(node.device_id) !== token) return;   // newer intent wins
+    const echo = pendingCommands.lastSleep(node.device_id);
+    if (echo && echo.on === wantOn && echo.ts >= startTs) return; // confirmed by the device
+    if (attempts >= RETRY_MAX) {
+      logger.warn(`Sleep ${message.type} to ${node.device_id}: no echo after ${attempts + 1} sends — giving up`);
+      return;
+    }
+    attempts++;
+    publish(topic, { ...message, ts: Date.now(), retry: attempts });
+    logger.info(`🔁 Sleep ${message.type} → ${node.device_id} retry #${attempts} (no echo yet)`);
+    setTimeout(tick, RETRY_GAP_MS);
+  };
+  setTimeout(tick, RETRY_GAP_MS);
+}
+
 function publishSleepCmd(node, type, payload = {}) {
   // Reliable: queues if the node is asleep, delivered on its next wake.
-  return deliver(node, { id: node.device_id, type, payload, ts: Date.now() });
+  const message  = { id: node.device_id, type, payload, ts: Date.now() };
+  const delivery = deliver(node, message);
+  // Only chase an echo for a command we actually put on the air. A queued one
+  // is flushed on the node's next telemetry, which is already proof it woke.
+  if (delivery === 'sent') {
+    const wantOn = (type === 'sleep_now') || (type === 'sleep_config' && payload.enabled === true);
+    if (type !== 'sleep_config' || payload.enabled != null) retrySleepUntilEcho(node, wantOn, message);
+  }
+  return delivery;
 }
 
 // 24h band schedule helpers. A band's interval applies from its start time until

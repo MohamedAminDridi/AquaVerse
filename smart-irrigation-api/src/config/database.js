@@ -3,9 +3,29 @@ const logger   = require('../utils/logger');
 
 exports.connectMongo = async () => {
   mongoose.set('strictQuery', true);
-  await mongoose.connect(process.env.MONGO_URI, {
-    serverSelectionTimeoutMS: 5000,
-  });
+
+  // Retry rather than die. A momentary DNS or routing hiccup should not leave
+  // the API permanently down waiting for someone to notice and restart it —
+  // especially with nodemon, which does not restart a crashed process.
+  const attempts = 5;
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      await mongoose.connect(process.env.MONGO_URI, {
+        serverSelectionTimeoutMS: 10000,
+        // Force IPv4. Node may resolve Atlas to a NAT64 IPv6 address
+        // (64:ff9b::…) on networks that cannot route it, producing
+        // ENETUNREACH alongside a timeout even while IPv4 works fine.
+        family: 4,
+      });
+      break;
+    } catch (e) {
+      if (i === attempts) throw e;
+      const wait = i * 3000;
+      logger.warn(`MongoDB connect failed (${i}/${attempts}): ${e.message} — retrying in ${wait / 1000}s`);
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+
   logger.info('MongoDB connected');
   mongoose.connection.on('disconnected', () => logger.warn('MongoDB disconnected'));
   mongoose.connection.on('error', (e) => logger.error('MongoDB error:', e));

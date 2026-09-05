@@ -5,7 +5,9 @@ const commandSchema = new mongoose.Schema({
   farm:     { type: mongoose.Schema.Types.ObjectId, ref: 'Farm', required: true },
   type:     { type: String, enum: ['valve_open','valve_close','valve_toggle','pump_start','pump_stop'], required: true },
   payload:  { type: mongoose.Schema.Types.Mixed, default: {} },
-  status:   { type: String, enum: ['pending','sent','acked','failed'], default: 'pending' },
+  // 'queued' = held by pendingCommands until the node's next wake (deliver() in
+  // irrigation.controller returns it whenever the node was not heard recently).
+  status:   { type: String, enum: ['pending','queued','sent','acked','failed'], default: 'pending' },
   source:   { type: String, enum: ['manual','automation','schedule','ai'], default: 'manual' },
   issuedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   acked_at: { type: Date, default: null },

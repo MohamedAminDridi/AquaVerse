@@ -2,19 +2,24 @@ const cron    = require('node-cron');
 const logger  = require('../utils/logger');
 const Node    = require('../models/Node.model');
 const Gateway = require('../models/Gateway.model');
+const Farm    = require('../models/Farm.model');
 const Alert   = require('../models/Alert.model');
 const weather = require('../services/weather.service');
 const { emitToFarm } = require('../socket/socketServer');
 
-// 1-hour cooldown: don't spam the same offline alert every cron tick
-async function offlineAlertExists(query) {
-  return Alert.exists({
-    ...query,
-    type:         'device_offline',
-    acknowledged: false,
-    createdAt:    { $gt: new Date(Date.now() - 60 * 60 * 1000) },
-  });
-}
+// Cooldown so the same offline alert is not raised on every cron tick. An hour
+// is right in production and far too long when testing — unplug a node twice in
+// one hour and the second event creates no alert, so no notification either.
+// ALERT_COOLDOWN_OFFLINE_MIN overrides it (set it to 1 while demonstrating).
+// How long a device must be silent before it counts as offline. These CANNOT go
+// below the reporting interval: the gateway heartbeats every 10 s and nodes
+// report every 5 s, so a cutoff under that would mark healthy hardware offline
+// between two normal messages. A gateway losing power is usually caught far
+// sooner anyway — the broker's Last Will arrives within seconds.
+const OFFLINE_GATEWAY_MS = (parseInt(process.env.OFFLINE_GATEWAY_SEC, 10) || 35) * 1000;
+const OFFLINE_NODE_MS    = (parseInt(process.env.OFFLINE_NODE_SEC, 10) || 30) * 1000;
+
+
 
 exports.startJobs = () => {
 
@@ -28,28 +33,29 @@ exports.startJobs = () => {
     // ── Gateways: offline if no heartbeat in 35 s ─────────────────────
     // Heartbeat is every 10 s (lightened from 3 s to unclog the gateway's TLS
     // link) → 35 s tolerates up to two lost heartbeats before declaring death.
-    const gwCutoff = new Date(now - 35 * 1000);
+    const gwCutoff = new Date(now - OFFLINE_GATEWAY_MS);
+    // A gateway that never sent a heartbeat has `last_heartbeat: null`, which no
+    // `$lt` can match, and one stuck at 'unknown' is not 'online' — either way it
+    // could never transition and so never raised an alert. Match all three.
+    const gwStale = {
+      $or: [
+        { last_heartbeat: { $lt: gwCutoff } },
+        { last_heartbeat: null },
+        { last_heartbeat: { $exists: false } },
+      ],
+    };
     const offlineGWs = await Gateway.find({
-      last_heartbeat: { $lt: gwCutoff },
-      status: 'online',
+      ...gwStale,
+      status: { $in: ['online', 'unknown'] },
     }).select('_id device_id farm');
 
     for (const gw of offlineGWs) {
       await Gateway.findByIdAndUpdate(gw._id, { status: 'offline' });
       logger.warn(`Gateway offline: ${gw.device_id}`);
 
-      // Create alert once per hour max
-      const exists = await offlineAlertExists({ farm: gw.farm });
-      if (!exists) {
-        const alert = await Alert.create({
-          farm:     gw.farm,
-          type:     'device_offline',
-          severity: 'critical',
-          message:  `Gateway "${gw.device_id}" went offline`,
-        });
-        emitToFarm(gw.farm.toString(), 'alert:new', alert.toObject());
-        logger.warn(`🚨 Alert created: gateway ${gw.device_id} offline`);
-      }
+      // Shared with the Last Will path so both raise it identically, with one
+      // cooldown between them.
+      await require('../services/deviceOffline.service').raiseGatewayOffline(gw);
 
       emitToFarm(gw.farm.toString(), 'gateway:status', {
         device_id: gw.device_id,
@@ -63,12 +69,24 @@ exports.startJobs = () => {
     // DYNAMIC cutoff instead of being skipped: 1.5× their full duty cycle
     // (+60 s margin). A sleeper that misses ~2 wakes is genuinely gone —
     // before this they stayed "online" forever even when powered off.
-    const nodeCutoff = new Date(now - 30 * 1000);
+    const nodeCutoff = new Date(now - OFFLINE_NODE_MS);
+    const stale = { $or: [{ last_seen: { $lt: nodeCutoff } }, { last_seen: null }, { last_seen: { $exists: false } }] };
     const offlineNodes = await Node.find({
-      last_seen: { $lt: nodeCutoff },
+      ...stale,
       status:    'online',
       'sleep.enabled': { $ne: true },
     }).select('_id device_id farm');
+
+    // A node registered in the dashboard but never heard from stays at the
+    // schema default 'unknown' forever (the sweep above only looks at 'online'),
+    // which renders as a confusing "unknown" chip on every screen. Flip those to
+    // 'offline' so the UI is honest. No alert: it was never up, so it is not an
+    // incident — just a device that has not reported yet.
+    const neverSeen = await Node.find({ ...stale, status: 'unknown' }).select('_id device_id');
+    for (const n of neverSeen) {
+      await Node.findByIdAndUpdate(n._id, { status: 'offline' });
+      logger.warn(`Node never reported: ${n.device_id} → offline`);
+    }
 
     const sleepers = await Node.find({
       status: 'online',
@@ -87,18 +105,8 @@ exports.startJobs = () => {
       await Node.findByIdAndUpdate(node._id, { status: 'offline', pump_state: 'off' });
       logger.warn(`Node offline: ${node.device_id}`);
 
-      const exists = await offlineAlertExists({ farm: node.farm, node: node._id });
-      if (!exists) {
-        const alert = await Alert.create({
-          farm:     node.farm,
-          node:     node._id,
-          type:     'device_offline',
-          severity: 'critical',
-          message:  `Node "${node.device_id}" went offline`,
-        });
-        emitToFarm(node.farm.toString(), 'alert:new', alert.toObject());
-        logger.warn(`🚨 Alert created: node ${node.device_id} offline`);
-      }
+      // Same shared raiser as gateways, so both behave identically.
+      await require('../services/deviceOffline.service').raiseNodeOffline(node);
 
       emitToFarm(node.farm.toString(), 'node:status', {
         device_id: node.device_id,
@@ -110,7 +118,10 @@ exports.startJobs = () => {
   // Every 20 s (was a 1-min cron): the sweep is the BACKUP detector — the
   // gateway's MQTT Last Will handles the instant case; this catches anything
   // the will misses (e.g. broker restart) and node silences.
-  setInterval(() => sweepOffline().catch((e) => logger.warn(`Sweep failed: ${e.message}`)), 20000);
+  // Every 5 s, not 20: the alert should follow the status change almost at once.
+  // This governs the DELAY between deciding a device is offline and raising the
+  // alert — not how long silence must last first, which is the cutoff below.
+  setInterval(() => sweepOffline().catch((e) => logger.warn(`Sweep failed: ${e.message}`)), 5000);
   setTimeout(() => sweepOffline().catch((e) => logger.warn(`Boot sweep failed: ${e.message}`)), 5000);
 
   // ── Irrigation schedules: open/close valves at their window each minute ──
@@ -195,6 +206,81 @@ exports.startJobs = () => {
       }
     }
   });
+
+  // ── AI autopilot: forecast every node + recommendations + closed-loop ──
+  // Every 5 min (and once 8 s after boot). Always forecasts & advises; only
+  // ACTUATES valves when the global Edge-AI switch is ON and a node opted into
+  // ai.autoIrrigate — and even then only on trusted data, never against rain,
+  // with a 20-min cooldown. Everything it does is logged as a Decision.
+  const runAutopilot = async () => {
+    const forecast = require('../services/forecast.service');
+    const rain     = require('../services/rain.service');
+    const irr      = require('../controllers/irrigation.controller');
+    const Decision = require('../models/Decision.model');
+    const SystemSetting = require('../models/SystemSetting.model');
+    const aiDoc = await SystemSetting.findOne({ key: 'ai' });
+    const aiOn  = !!aiDoc?.aiEnabled;
+
+    const farms = await Farm.find().select('_id name location');
+    for (const farm of farms) {
+      const nodes = await Node.find({ farm: farm._id });
+      if (!nodes.length) continue;
+      const { forecasts, recommendations, weather: wx } = await forecast.runFarm(farm, nodes);
+
+      // Rain fusion: settle any open forecast-verification window, then open a
+      // new one if rain is predicted — this is what builds forecast confidence.
+      rain.settle(farm._id);
+      if (wx?.rainInH != null) rain.notePrediction(farm._id, wx.rainInH);
+      const rainingNow = rain.isRainingNow(farm._id);
+      const rainState  = rain.current(farm._id);
+      if (rainState) emitToFarm(farm._id.toString(), 'rain:update', { farm: farm._id, ...rainState, confidence: rain.confidence(farm._id) });
+
+      forecasts.forEach((f) => f.ok && emitToFarm(farm._id.toString(), 'ai:forecast', f));
+      if (recommendations.length) emitToFarm(farm._id.toString(), 'ai:recommendation', { farm: farm._id, recs: recommendations });
+      if (rainingNow) emitToFarm(farm._id.toString(), 'ai:recommendation', { farm: farm._id, recs: [{ level: 'info', text: '🌧 Rain detected on site — irrigation paused' }] });
+
+      if (!aiOn) continue;                                   // advisory only when AI off
+      for (const node of nodes) {
+        if (!node.ai?.autoIrrigate) continue;
+        const f = forecasts.find((x) => x.deviceId === node.device_id);
+        if (!f || !f.ok) continue;
+        const online = node.status === 'online';
+        const soil = f.current;
+        const target = node.ai.soilTarget ?? 35;
+        const trusted = soil != null && soil > 0 && soil < 100;   // basic trust gate
+        // Rain fusion decides the skip: the on-site sensor is authoritative for
+        // NOW, the forecast plans ahead (and is discounted if its local
+        // confidence is poor). Real falling water always beats a prediction.
+        const rainFusion = rain.fuse(farm._id, wx, f.hoursToDry);
+        const rainSoon = rainFusion.skipIrrigation;
+        const coolOk = !node.ai.lastAuto || (Date.now() - new Date(node.ai.lastAuto).getTime() > 20 * 60 * 1000);
+        const valveOpen = node.valve_state === 'open';
+
+        let act = null;
+        if (online && trusted && !valveOpen && soil <= target - 3 && !rainSoon && coolOk) act = 'open';
+        else if (valveOpen && (soil >= target || rainSoon)) act = 'close';
+        if (!act) continue;
+
+        irr.deliverToNode(node, { id: node.device_id, type: act === 'open' ? 'valve_open' : 'valve_close', payload: act === 'open' ? { percent: 100 } : {}, ts: Date.now() });
+        node.valve_state = act === 'open' ? 'open' : 'closed';
+        node.ai.lastAuto = new Date(); node.markModified('ai');
+        await node.save().catch(() => {});
+        await irr.reconcileFarmPump(farm._id).catch(() => {});
+        await Decision.create({
+          farm: farm._id, deviceId: node.device_id,
+          inputs: { soil, hoursToDry: f.hoursToDry, rainInH: f.rainInH, rainingNow: rainFusion.rainingNow },
+          irrigate: act === 'open', duration_s: 0,
+          why: act === 'open' ? 'autopilot: soil below target, no rain'
+             : (rainSoon ? `autopilot: ${rainFusion.reason || 'rain incoming'}` : 'autopilot: target reached'),
+          agree: null, modelVersion: 'autopilot-v0',
+        }).catch(() => {});
+        emitToFarm(farm._id.toString(), 'ai:recommendation', { farm: farm._id, recs: [{ deviceId: node.device_id, level: act === 'open' ? 'warn' : 'info', text: `🤖 Autopilot ${act === 'open' ? 'opened' : 'closed'} ${node.device_id} (soil ${soil}% / target ${target}%)` }] });
+        logger.info(`🤖 Autopilot ${act} ${node.device_id} soil=${soil}% target=${target}%`);
+      }
+    }
+  };
+  cron.schedule('*/5 * * * *', () => runAutopilot().catch((e) => logger.warn(`Autopilot failed: ${e.message}`)));
+  setTimeout(() => runAutopilot().catch((e) => logger.warn(`Autopilot warm-up failed: ${e.message}`)), 8000);
 
   // ── Live weather: fetch Open-Meteo per farm and broadcast over Socket.IO ──
   // Every 15 min (Open-Meteo updates ~hourly; 15 min keeps clients fresh while

@@ -42,6 +42,14 @@ const nodeSchema = new mongoose.Schema({
     wakeTime:    { type: String, default: '06:00' },
     state:       { type: String, enum: ['awake','sleeping'], default: 'awake' },
   },
+  // Closed-loop AI autopilot (server-side brain). When autoIrrigate is on AND the
+  // global Edge-AI switch is on, the autopilot cron opens/closes this node's valve
+  // to hold soil near soilTarget — only on TRUSTED data, never against rain.
+  ai: {
+    autoIrrigate: { type: Boolean, default: false },
+    soilTarget:   { type: Number, default: 35, min: 5, max: 95 },   // % to maintain
+    lastAuto:     { type: Date,   default: null },                  // cooldown anchor
+  },
 }, { timestamps: true });
 
 module.exports = mongoose.model('Node', nodeSchema);

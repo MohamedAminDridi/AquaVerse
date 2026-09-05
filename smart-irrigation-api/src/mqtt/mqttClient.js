@@ -127,7 +127,9 @@ async function handleMessage(topic, buffer) {
       });
 
     } else if (category === 'nodes' && msgType === 'alerts') {
-      emitToFarm(farmId, 'alert:new', { device_id: deviceId, ...payload });
+      // Carry the farm id like every other alert:new emitter does — the Alerts
+      // screen buckets live alerts per farm and would otherwise drop these.
+      emitToFarm(farmId, 'alert:new', { farm: farmId, device_id: deviceId, ...payload });
 
     } else if (category === 'gateways' && msgType === 'heartbeat') {
       await handleGatewayHeartbeat(farmId, deviceId, payload);
@@ -139,7 +141,31 @@ async function handleMessage(topic, buffer) {
       // for the minute-based heartbeat sweep.
       const Gateway = require('../models/Gateway.model');
       const statusVal = payload.status === 'online' ? 'online' : 'offline';
-      await Gateway.findOneAndUpdate({ device_id: deviceId }, { status: statusVal });
+      const prev = await Gateway.findOneAndUpdate({ device_id: deviceId }, { status: statusVal });
+      const gw = prev ? { ...prev.toObject(), status: statusVal } : null;
+
+      // This is usually the FIRST thing to notice a dead gateway — the Last Will
+      // beats the 35 s heartbeat sweep. Raising the alert here is what makes
+      // gateway-offline notifications work at all: by the time the sweep runs the
+      // status is already 'offline', so the sweep alone never fires.
+      if (gw) {
+        const svc = require('../services/deviceOffline.service');
+        try {
+          if (statusVal === 'offline') {
+            await svc.raiseGatewayOffline(gw);
+          } else {
+            // A birth message is published the instant the gateway connects, so
+            // it IS the "went online" event — notify on it directly rather than
+            // only when the database happened to have recorded it as offline
+            // first. That condition missed reconnects after an API restart, or
+            // any drop the server never saw. The service's own short window
+            // keeps a flapping link from spamming.
+            await svc.notifyGatewayOnline(gw);
+          }
+        } catch (e) {
+          logger.error(`Gateway status notification failed: ${e.message}`);
+        }
+      }
       emitToFarm(farmId, 'gateway:status', {
         device_id: deviceId,
         status:    statusVal,
@@ -232,6 +258,10 @@ async function handleGatewayHeartbeat(farmId, deviceId, payload) {
     logger.warn(`Gateway "${deviceId}" not in DB — ignoring heartbeat`);
     return;
   }
+  // A gateway does not always announce itself with a birth message — after a
+  // WiFi blip it may just resume heartbeating. Catch the recovery here too, or
+  // the "back online" notice would depend on how it happened to reconnect.
+  const wasOffline = existing.status !== 'online';
 
   const gw = await Gateway.findOneAndUpdate(
     { device_id: deviceId },
@@ -249,12 +279,25 @@ async function handleGatewayHeartbeat(farmId, deviceId, payload) {
     { new: true }
   );
 
+  if (wasOffline && gw) {
+    require('../services/deviceOffline.service').notifyGatewayOnline(gw).catch(() => {});
+  }
+
+  // Rain sensor rides on the gateway heartbeat (farm-level ground truth).
+  let rain = null;
+  if (payload.rain != null) {
+    rain = require('../services/rain.service')
+      .ingest(farmId, deviceId, { raining: !!payload.rain, wetness: payload.wet ?? 0 });
+    emitToFarm(farmId, 'rain:update', { farm: farmId, ...rain });
+  }
+
   emitToFarm(farmId, 'gateway:status', {
     device_id: deviceId,
     status:    'online',
     ip, rssi, uptime_s,
     fw:        payload.fw ?? null,
     pkts_ok:   payload.pkts_ok ?? null,
+    ...(rain ? { rain: rain.raining, wetness: rain.wetness } : {}),
     ts:        new Date(),
   });
   // debug: fires every heartbeat (~3 s/gateway) — hidden in production logs

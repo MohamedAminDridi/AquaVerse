@@ -65,3 +65,12 @@ exports.noteValve = (deviceId, state) => {
   if (deviceId && state) lastValve.set(deviceId, { state, ts: Date.now() });
 };
 exports.lastValve = (deviceId) => lastValve.get(deviceId);
+
+// Same idea for the deep-sleep duty cycle: the node reports "slp" in every
+// telemetry packet, which is the only proof a sleep_now/wake command actually
+// landed. The DB holds the INTENT (sleep.enabled), so it can't confirm delivery.
+const lastSleep = new Map();   // device_id -> { on: boolean, ts }
+exports.noteSleep = (deviceId, on) => {
+  if (deviceId && on != null) lastSleep.set(deviceId, { on: !!on, ts: Date.now() });
+};
+exports.lastSleep = (deviceId) => lastSleep.get(deviceId);

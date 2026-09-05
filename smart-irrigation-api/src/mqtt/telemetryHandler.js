@@ -6,6 +6,9 @@ const { emitToFarm } = require('../socket/socketServer');
 const pendingCommands = require('./pendingCommands');
 const logger         = require('../utils/logger');
 
+// How long before the same node may raise another low-battery alert.
+const BATTERY_COOLDOWN_MS = (parseInt(process.env.ALERT_COOLDOWN_BATTERY_MIN, 10) || 30) * 60 * 1000;
+
 /**
  * Handles: farms/{farmId}/nodes/{nodeId}/telemetry
  *
@@ -64,9 +67,16 @@ module.exports = async function handleTelemetry(farmId, nodeDeviceId, payload) {
     // Deep-sleep duty-cycle timing reported by the node (slp/awk/nap/up). The
     // dashboard anchors its awake↔sleep countdown to these real device clocks.
     const slpOn  = payload.slp != null ? !!payload.slp : null;  // sleep mode active?
+    // Proof the node actually applied a sleep_now/wake command — the retry loop
+    // in irrigation.controller compares against this, not against the DB intent.
+    if (slpOn != null) pendingCommands.noteSleep(node.device_id, slpOn);
     const slpAwk = payload.awk ?? null;                          // awake window (s)
     const slpNap = payload.nap ?? null;                          // sleep window (s)
     const slpUp  = payload.up  ?? null;                          // s since this wake
+
+    // A node that was offline and is now reporting has recovered. Captured
+    // before the update, since the update itself sets status to 'online'.
+    const nodeWasOffline = node.status !== 'online';
 
     // Update node live state (including valve/pump so the DB is always accurate)
     await Node.findByIdAndUpdate(node._id, {
@@ -81,6 +91,14 @@ module.exports = async function handleTelemetry(farmId, nodeDeviceId, payload) {
       ...(pumpState  != null  ? { pump_state:  pumpState  } : {}),
       ...(payload.fw          ? { firmware_version: payload.fw } : {}),
     });
+
+    if (nodeWasOffline) {
+      // Resolves the open offline alert and sends the recovery notice, exactly
+      // as a gateway does.
+      require('../services/deviceOffline.service')
+        .notifyNodeOnline(node)
+        .catch((e) => logger.warn(`Node online notice failed: ${e.message}`));
+    }
 
     // Save to time-series collection — match schema exactly:
     //   ts          = timeField  (required Date)
@@ -171,13 +189,14 @@ module.exports = async function handleTelemetry(farmId, nodeDeviceId, payload) {
     // debug: fires every report (~5 s/node) — hidden in production logs
     logger.debug(`📊 [${nodeDeviceId}] soil=${soil}% temp=${temp}°C hum=${hum}% bat=${bat}% rssi=${rssi} valve=${valveState ?? '?'} pump=${pumpState ?? '?'}`);
 
-    // ── Battery low alert (< 30%) — 30-minute cooldown ───────────────
+    // ── Battery low alert (< 30%) ────────────────────────────────────
+    // Cooldown via ALERT_COOLDOWN_BATTERY_MIN (default 30 min).
     if (bat !== null && bat < 30) {
       const recentBatAlert = await Alert.findOne({
         node:         node._id,
         type:         'low_battery',
         acknowledged: false,
-        createdAt:    { $gt: new Date(Date.now() - 30 * 60 * 1000) },
+        createdAt:    { $gt: new Date(Date.now() - BATTERY_COOLDOWN_MS) },
       });
       if (!recentBatAlert) {
         const alert = await Alert.create({

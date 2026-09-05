@@ -6,6 +6,7 @@ router.use(protect);
 
 // Mounted at /api/alerts
 router.get ('/',                          ctrl.listAlerts);
+router.get ('/summary',                   ctrl.alertSummary);
 router.get ('/:id',                       ctrl.getAlert);
 router.put ('/:id/acknowledge',           ctrl.acknowledgeAlert);
 
