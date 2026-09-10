@@ -1,12 +1,17 @@
 const router  = require('express').Router({ mergeParams: true });
 const ctrl    = require('../controllers/node.controller');
-const { protect, farmAccess } = require('../middleware/auth.middleware');
+const { protect, farmAccess, farmControl } = require('../middleware/auth.middleware');
 
 router.use(protect);
 
 // Mounted at /api/farms/:farmId/nodes
-router.route('/')           .get(farmAccess(), ctrl.listNodes).post(farmAccess(), ctrl.createNode);
-router.route('/:nodeId')    .get(ctrl.getNode).put(ctrl.updateNode).delete(ctrl.deleteNode);
-router.get  ('/:nodeId/status', ctrl.getLiveStatus);
+// Même correction que pour les passerelles : les routes d'élément étaient ouvertes.
+router.route('/')           .get(farmAccess(),  ctrl.listNodes)
+                            .post(farmControl(), ctrl.createNode);
+router.route('/:nodeId')    .get(farmAccess(),  ctrl.getNode)
+                            .put(farmControl(), ctrl.updateNode)
+                            .delete(farmControl(), ctrl.deleteNode);
+router.get  ('/:nodeId/impact', farmControl(), ctrl.nodeImpact);
+router.get  ('/:nodeId/status', farmAccess(),  ctrl.getLiveStatus);
 
 module.exports = router;

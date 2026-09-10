@@ -84,10 +84,44 @@ function compose(alert) {
  * Deliver one alert to every registered device. Tokens FCM reports as dead are
  * deleted, so the list does not rot into a pile of invalid ids.
  */
+
+/**
+ * Les jetons autorisés à recevoir une alerte de cette exploitation.
+ *
+ * Une alerte sans exploitation rattachée (incident système) ne part qu'aux
+ * administrateurs : elle ne concerne aucun client en particulier.
+ */
+async function tokensForFarm(farmId) {
+  const User = require('../models/User.model');
+  const Farm = require('../models/Farm.model');
+
+  const admins = await User.find({ role: 'admin', isActive: true }).distinct('_id');
+  let recipients = admins;
+
+  if (farmId) {
+    const farm = await Farm.findById(farmId).select('owner members.user').lean();
+    if (farm) {
+      const ids = [farm.owner, ...(farm.members || []).map((m) => m.user)].filter(Boolean);
+      recipients = [...admins, ...ids];
+    }
+  }
+
+  const uniq = [...new Set(recipients.map(String))];
+  const rows = await PushToken.find({ user: { $in: uniq } }).select('token').lean();
+  return rows.map((t) => t.token);
+}
+
 exports.sendAlert = async (alert) => {
   if (!init()) return { sent: 0, skipped: true };
 
-  const tokens = (await PushToken.find().select('token').lean()).map((t) => t.token);
+  // Ciblage par exploitation.
+  //
+  // Sans ce filtre, chaque terminal enregistré recevait CHAQUE alerte de la
+  // plateforme : un client était réveillé la nuit par la passerelle d'un autre.
+  // Les destinataires sont donc les personnes qui ont réellement accès à
+  // l'exploitation concernée — propriétaire, membres, et les administrateurs,
+  // qui supervisent l'ensemble du parc.
+  const tokens = await tokensForFarm(alert.farm);
   if (!tokens.length) {
     stats.lastSend = { at: new Date(), title: 'skipped', sent: 0, of: 0, error: 'no registered devices' };
     return { sent: 0, skipped: true };

@@ -1,5 +1,6 @@
 const router = require('express').Router();
-const { protect } = require('../middleware/auth.middleware');
+const { protect, nodeAccess } = require('../middleware/auth.middleware');
+const { farmIdsFor, farmFilterFor } = require('../utils/scope');
 const { asyncHandler } = require('../utils/asyncHandler');
 const { success } = require('../utils/apiResponse');
 const Decision = require('../models/Decision.model');
@@ -12,7 +13,10 @@ router.use(protect);
 // autopilot cron; recomputed on demand if the cache is empty).
 router.get('/forecast', asyncHandler(async (req, res) => {
   const { farmId } = req.query;
-  const nodes = await Node.find(farmId ? { farm: farmId } : {}).select('device_id ai');
+  // Sans périmètre, l'absence de farmId sélectionnait tous les nœuds de la
+  // plateforme, et le résultat exposait les identifiants d'équipement d'autrui.
+  const nodes = await Node.find({ farm: await farmFilterFor(req.user, farmId) })
+    .select('device_id ai');
   let forecasts = forecast.latestAll(nodes.map((n) => n.device_id));
   if (!forecasts.length && farmId) {
     const Farm = require('../models/Farm.model');
@@ -27,6 +31,11 @@ router.get('/forecast', asyncHandler(async (req, res) => {
 router.get('/rain', asyncHandler(async (req, res) => {
   const rain = require('../services/rain.service');
   const farmId = req.query.farmId;
+  if (farmId) {
+    const allowed = await farmIdsFor(req.user);
+    if (!allowed.some((id) => String(id) === String(farmId)))
+      return res.status(404).json({ success: false, message: 'Farm not found' });
+  }
   success(res, {
     rain: {
       sensor: rain.current(farmId),
@@ -38,7 +47,8 @@ router.get('/rain', asyncHandler(async (req, res) => {
 
 // PUT /api/ai/node/:nodeId/autopilot { autoIrrigate, soilTarget } — opt a node
 // into closed-loop auto-irrigation and set its soil target.
-router.put('/node/:nodeId/autopilot', asyncHandler(async (req, res) => {
+// Armer l'autopilote fait agir le matériel : droit de contrôle exigé.
+router.put('/node/:nodeId/autopilot', nodeAccess({ control: true }), asyncHandler(async (req, res) => {
   const node = await Node.findById(req.params.nodeId);
   if (!node) return res.status(404).json({ success: false, message: 'Node not found' });
   if (!node.ai) node.ai = {};
@@ -53,7 +63,7 @@ router.put('/node/:nodeId/autopilot', asyncHandler(async (req, res) => {
 // running agreement % the AI Brain layer displays on the brain.
 router.get('/decisions', asyncHandler(async (req, res) => {
   const { farmId, limit = 50 } = req.query;
-  const filter = farmId ? { farm: farmId } : {};
+  const filter = { farm: await farmFilterFor(req.user, farmId) };
   const decisions = await Decision.find(filter)
     .sort({ ts: -1 }).limit(Math.min(+limit || 50, 200)).lean();
   const judged = decisions.filter((d) => d.agree != null);

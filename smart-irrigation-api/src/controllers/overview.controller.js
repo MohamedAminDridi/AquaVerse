@@ -5,6 +5,7 @@ const Gateway = require('../models/Gateway.model');
 const Alert   = require('../models/Alert.model');
 const { asyncHandler } = require('../utils/asyncHandler');
 const { success } = require('../utils/apiResponse');
+const { farmIdsFor, accessMapFor } = require('../utils/scope');
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Everything the mobile app needs to draw its first screen, in ONE request.
@@ -18,7 +19,14 @@ const { success } = require('../utils/apiResponse');
 // client waits for one response.
 // ─────────────────────────────────────────────────────────────────────────────
 exports.overview = asyncHandler(async (req, res) => {
-  const farms = await Farm.find().select('name crop_type size_ha location isActive').lean();
+  // Scoped: a client must never receive farms it has no part in. Before this
+  // line filtered, every authenticated account got the whole fleet.
+  const scoped = await farmIdsFor(req.user);
+  // Le niveau d'accès accompagne les données : l'interface masque les
+  // commandes plutôt que de les proposer pour ensuite essuyer un refus.
+  const access = await accessMapFor(req.user);
+  const farms = await Farm.find({ _id: { $in: scoped } })
+    .select('name crop_type size_ha location isActive').lean();
   const farmIds = farms.map((f) => f._id);
 
   // `lean()` and an explicit field list: this is a summary, and shipping whole
@@ -34,7 +42,10 @@ exports.overview = asyncHandler(async (req, res) => {
       .select('name device_id status farm last_heartbeat ip rssi uptime_s tls_enabled')
       .lean(),
 
+    // Sans ce $match, les décomptes portaient sur TOUTES les exploitations de la
+    // plateforme : un client voyait le nombre d'alertes des autres.
     Alert.aggregate([
+      { $match: { farm: { $in: farmIds } } },
       { $group: {
         _id:            '$farm',
         total:          { $sum: 1 },
@@ -47,7 +58,9 @@ exports.overview = asyncHandler(async (req, res) => {
       } },
     ]),
 
-    Alert.find({ acknowledged: false })
+    // Idem, en pire : cette liste est affichée telle quelle sur l'écran d'accueil,
+    // avec le nom de l'exploitation, du nœud et de la passerelle concernés.
+    Alert.find({ acknowledged: false, farm: { $in: farmIds } })
       .populate('node', 'name device_id')
       .populate('gateway', 'name device_id')
       .populate('farm', 'name')
@@ -63,5 +76,5 @@ exports.overview = asyncHandler(async (req, res) => {
     byFarm[String(_id)] = counts;
   }
 
-  success(res, { farms, nodes, gateways, byFarm, openAlerts });
+  success(res, { farms, nodes, gateways, byFarm, openAlerts, access });
 });

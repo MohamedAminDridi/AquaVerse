@@ -7,6 +7,7 @@ const topics       = require('../utils/mqttTopics');
 const { asyncHandler } = require('../utils/asyncHandler');
 const { success, created } = require('../utils/apiResponse');
 const logger = require('../utils/logger');
+const { canAccessFarm, canControlFarm } = require('../utils/scope');
 
 const clampPercent = (p) => Math.max(0, Math.min(100, Math.round(Number(p) || 0)));
 
@@ -99,6 +100,10 @@ async function reconcileFarmPump(farmId) {
 async function issueValve(req, res, type) {
   const node = await Node.findById(req.params.nodeId);
   if (!node) return res.status(404).json({ success: false, message: 'Node not found' });
+  // Agir exige le droit de contrôle : un membre invité en consultation voit le
+  // nœud mais ne doit pas pouvoir bouger la vanne ni changer son cycle.
+  if (!(await canControlFarm(req.user, node.farm)))
+    return res.status(403).json({ success: false, message: 'Lecture seule sur cette exploitation' });
 
   // Opening carries a 0–100% servo position (100% = 90° at the node).
   let payload = req.body || {};
@@ -149,6 +154,10 @@ exports.toggleValve = asyncHandler((req, res) => issueValve(req, res, 'valve_tog
 async function manualPump(req, res, type) {
   const node = await Node.findById(req.params.nodeId);
   if (!node) return res.status(404).json({ success: false, message: 'Node not found' });
+  // Agir exige le droit de contrôle : un membre invité en consultation voit le
+  // nœud mais ne doit pas pouvoir bouger la vanne ni changer son cycle.
+  if (!(await canControlFarm(req.user, node.farm)))
+    return res.status(403).json({ success: false, message: 'Lecture seule sur cette exploitation' });
   const gateways = await Gateway.find({ farm: node.farm }).select('device_id');
   gateways.forEach((gw) => {
     publish(topics.command(node.farm.toString(), gw.device_id), {
@@ -232,8 +241,14 @@ exports.hhmmToMin = hhmmToMin;
 
 // GET the node's sleep config.
 exports.getSleep = asyncHandler(async (req, res) => {
-  const node = await Node.findById(req.params.nodeId).select('sleep device_id name');
+  // `farm` fait partie de la projection : sans lui le contrôle d'accès porterait
+  // sur `undefined` et refuserait systématiquement.
+  const node = await Node.findById(req.params.nodeId).select('sleep device_id name farm');
   if (!node) return res.status(404).json({ success: false, message: 'Node not found' });
+  // Lecture : voir le cycle de veille suffit à comprendre pourquoi un nœud ne
+  // répond pas, y compris pour un accès en consultation.
+  if (!(await canAccessFarm(req.user, node.farm)))
+    return res.status(404).json({ success: false, message: 'Node not found' });
   success(res, { sleep: node.sleep || {} });
 });
 
@@ -244,6 +259,10 @@ const clampMin = (v, d) => { const n = Number(v); return Number.isFinite(n) ? Ma
 exports.setSleep = asyncHandler(async (req, res) => {
   const node = await Node.findById(req.params.nodeId);
   if (!node) return res.status(404).json({ success: false, message: 'Node not found' });
+  // Agir exige le droit de contrôle : un membre invité en consultation voit le
+  // nœud mais ne doit pas pouvoir bouger la vanne ni changer son cycle.
+  if (!(await canControlFarm(req.user, node.farm)))
+    return res.status(403).json({ success: false, message: 'Lecture seule sur cette exploitation' });
   const b = req.body || {};
   const s = node.sleep;
   if (Array.isArray(b.bands)) {
@@ -281,6 +300,10 @@ exports.setSleep = asyncHandler(async (req, res) => {
 exports.sleepNow = asyncHandler(async (req, res) => {
   const node = await Node.findById(req.params.nodeId);
   if (!node) return res.status(404).json({ success: false, message: 'Node not found' });
+  // Agir exige le droit de contrôle : un membre invité en consultation voit le
+  // nœud mais ne doit pas pouvoir bouger la vanne ni changer son cycle.
+  if (!(await canControlFarm(req.user, node.farm)))
+    return res.status(403).json({ success: false, message: 'Lecture seule sur cette exploitation' });
   const s = node.sleep;
   if (req.body?.awakeMin != null) s.awakeMin = clampMin(req.body.awakeMin, s.awakeMin);
   if (req.body?.sleepMin != null) s.sleepMin = clampMin(req.body.sleepMin, s.sleepMin);
@@ -295,6 +318,10 @@ exports.sleepNow = asyncHandler(async (req, res) => {
 exports.wakeNode = asyncHandler(async (req, res) => {
   const node = await Node.findById(req.params.nodeId);
   if (!node) return res.status(404).json({ success: false, message: 'Node not found' });
+  // Agir exige le droit de contrôle : un membre invité en consultation voit le
+  // nœud mais ne doit pas pouvoir bouger la vanne ni changer son cycle.
+  if (!(await canControlFarm(req.user, node.farm)))
+    return res.status(403).json({ success: false, message: 'Lecture seule sur cette exploitation' });
   node.sleep.enabled = false; node.sleep.state = 'awake';
   node.markModified('sleep');
   await node.save();
@@ -303,6 +330,13 @@ exports.wakeNode = asyncHandler(async (req, res) => {
 });
 
 exports.getCommands = asyncHandler(async (req, res) => {
+  // L'historique des ordres dit qui a fait quoi sur l'installation : il suit le
+  // même périmètre que le reste, sans quoi un identifiant de nœud suffisait à le lire.
+  const owner = await Node.findById(req.params.nodeId).select('farm').lean();
+  if (!owner) return res.status(404).json({ success: false, message: 'Node not found' });
+  if (!(await canAccessFarm(req.user, owner.farm)))
+    return res.status(404).json({ success: false, message: 'Node not found' });
+
   const { page = 1, limit = 20, status } = req.query;
   const filter = { node: req.params.nodeId };
   if (status) filter.status = status;
@@ -317,5 +351,7 @@ exports.getCommandStatus = asyncHandler(async (req, res) => {
   const cmd = await Command.findOne({ _id: req.params.cmdId, node: req.params.nodeId })
     .populate('issuedBy', 'name');
   if (!cmd) return res.status(404).json({ success: false, message: 'Command not found' });
+  if (!(await canAccessFarm(req.user, cmd.farm)))
+    return res.status(404).json({ success: false, message: 'Command not found' });
   success(res, { command: cmd });
 });

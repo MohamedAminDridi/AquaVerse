@@ -1,6 +1,7 @@
 const Node          = require('../models/Node.model');
 const { asyncHandler } = require('../utils/asyncHandler');
 const { success, created } = require('../utils/apiResponse');
+const del = require('../services/deletion.service');
 
 exports.listNodes = asyncHandler(async (req, res) => {
   const { status, gateway } = req.query;
@@ -28,9 +29,26 @@ exports.updateNode = asyncHandler(async (req, res) => {
   success(res, { node });
 });
 
+/* GET /api/farms/:farmId/nodes/:nodeId/impact */
+exports.nodeImpact = asyncHandler(async (req, res) => {
+  const node = await Node.findById(req.params.nodeId).select('name device_id').lean();
+  if (!node) return res.status(404).json({ success: false, message: 'Node not found' });
+  const impact = await del.nodeImpact(req.params.nodeId);
+  success(res, { node, impact });
+});
+
+/**
+ * DELETE /api/farms/:farmId/nodes/:nodeId
+ *
+ * En cascade : l'historique de mesures, les commandes, les alertes et les
+ * programmes qui ne visaient que ce nœud partent avec lui. Un programme qui
+ * visait toute l'exploitation est conservé.
+ */
 exports.deleteNode = asyncHandler(async (req, res) => {
-  await Node.findByIdAndDelete(req.params.nodeId);
-  res.status(204).send();
+  const node = await Node.findById(req.params.nodeId).select('name device_id').lean();
+  if (!node) return res.status(404).json({ success: false, message: 'Node not found' });
+  const impact = await del.deleteNode(req.params.nodeId);
+  success(res, { impact }, `Nœud « ${node.name || node.device_id} » supprimé`);
 });
 
 exports.getLiveStatus = asyncHandler(async (req, res) => {

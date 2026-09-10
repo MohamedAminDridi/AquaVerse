@@ -2,6 +2,7 @@ const Gateway      = require('../models/Gateway.model');
 const AppError     = require('../utils/AppError');
 const { asyncHandler } = require('../utils/asyncHandler');
 const { success, created } = require('../utils/apiResponse');
+const del = require('../services/deletion.service');
 
 exports.listGateways = asyncHandler(async (req, res) => {
   const gateways = await Gateway.find({ farm: req.params.farmId }).sort('-createdAt');
@@ -40,8 +41,30 @@ exports.updateGateway = asyncHandler(async (req, res) => {
   success(res, { gateway });
 });
 
+/* GET /api/farms/:farmId/gateways/:gwId/impact */
+exports.gatewayImpact = asyncHandler(async (req, res) => {
+  const gw = await Gateway.findById(req.params.gwId).select('name device_id farm').lean();
+  if (!gw) return res.status(404).json({ success: false, message: 'Gateway not found' });
+  const impact = await del.gatewayImpact(req.params.gwId);
+  // Les autres passerelles de la même ferme, pour proposer un réaffectation.
+  const others = await Gateway.find({ farm: gw.farm, _id: { $ne: gw._id } })
+    .select('name device_id').lean();
+  success(res, { gateway: gw, impact, others });
+});
+
+/**
+ * DELETE /api/farms/:farmId/gateways/:gwId?mode=detach|reassign|cascade
+ *
+ * `mode` dit ce qu'il advient des nœuds qu'elle relayait. Par défaut ils sont
+ * détachés explicitement plutôt que laissés à pointer vers un document effacé.
+ */
 exports.deleteGateway = asyncHandler(async (req, res) => {
-  await Gateway.findByIdAndDelete(req.params.gwId);
+  const gw = await Gateway.findById(req.params.gwId).select('name device_id').lean();
+  if (!gw) return res.status(404).json({ success: false, message: 'Gateway not found' });
+  const mode = ['detach', 'reassign', 'cascade'].includes(req.query.mode) ? req.query.mode : 'detach';
+  if (mode === 'reassign' && !req.query.reassignTo)
+    return res.status(400).json({ success: false, message: 'reassignTo is required for mode=reassign' });
+  await del.deleteGateway(req.params.gwId, { mode, reassignTo: req.query.reassignTo });
   res.status(204).send();
 });
 

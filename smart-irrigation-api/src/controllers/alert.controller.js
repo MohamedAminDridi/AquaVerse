@@ -3,6 +3,7 @@ const Alert       = require('../models/Alert.model');
 const Node        = require('../models/Node.model');
 const AlertRule   = require('../models/AlertRule.model');
 const { asyncHandler } = require('../utils/asyncHandler');
+const { farmIdsFor, farmFilterFor, canAccessFarm, canControlFarm } = require('../utils/scope');
 const { success, created, paginated } = require('../utils/apiResponse');
 
 // Per-farm alert counts for the Alerts screen's farm grid. Aggregated in the DB
@@ -18,6 +19,8 @@ exports.alertSummary = asyncHandler(async (req, res) => {
   if (req.query.by === 'gateway') {
     const { farm } = req.query;
     if (!farm) return res.status(400).json({ success: false, message: 'farm is required for by=gateway' });
+    if (!(await canAccessFarm(req.user, farm)))
+      return res.status(403).json({ success: false, message: 'Not allowed on this farm' });
     const rows = await Alert.aggregate([
       { $match: { farm: new mongoose.Types.ObjectId(String(farm)) } },
       { $lookup: { from: 'nodes', localField: 'node', foreignField: '_id', as: '_n' } },
@@ -48,7 +51,10 @@ exports.alertSummary = asyncHandler(async (req, res) => {
     return success(res, { byGateway, unassigned });
   }
 
+  // Même règle que partout : l'agrégat ne porte que sur les fermes du périmètre.
+  const scoped = await farmIdsFor(req.user);
   const rows = await Alert.aggregate([
+    { $match: { farm: { $in: scoped } } },
     { $group: {
       _id:            '$farm',
       total:          { $sum: 1 },
@@ -73,8 +79,9 @@ exports.alertSummary = asyncHandler(async (req, res) => {
 
 exports.listAlerts = asyncHandler(async (req, res) => {
   const { farm, gateway, scope, kind, severity, acknowledged, page = 1, limit = 20 } = req.query;
-  const filter = {};
-  if (farm)         filter.farm = farm;
+  // Le périmètre prime sur le paramètre : un identifiant de ferme étranger
+  // donne un résultat vide, jamais les alertes d'autrui.
+  const filter = { farm: await farmFilterFor(req.user, farm) };
   // An alert is about a GATEWAY (alert.gateway set), a NODE (alert.node set), or
   // neither — a farm-level system alert. That distinction is what the Alerts
   // screen's type filter drives.
@@ -117,11 +124,18 @@ exports.getAlert = asyncHandler(async (req, res) => {
   const alert = await Alert.findById(req.params.id)
     .populate('node', 'name device_id').populate('acknowledged_by', 'name');
   if (!alert) return res.status(404).json({ success: false, message: 'Alert not found' });
+  if (!(await canAccessFarm(req.user, alert.farm)))
+    return res.status(404).json({ success: false, message: 'Alert not found' });
   success(res, { alert });
 });
 
 exports.acknowledgeAlert = asyncHandler(async (req, res) => {
   const note = String(req.body?.note ?? '').trim().slice(0, 500);
+  // Acquitter est une écriture : on vérifie le périmètre AVANT de modifier.
+  const target = await Alert.findById(req.params.id).select('farm').lean();
+  if (!target) return res.status(404).json({ success: false, message: 'Alert not found' });
+  if (!(await canControlFarm(req.user, target.farm)))
+    return res.status(403).json({ success: false, message: 'Lecture seule sur cette exploitation' });
   const alert = await Alert.findByIdAndUpdate(req.params.id, {
     acknowledged: true, acknowledged_by: req.user._id, acknowledged_at: new Date(),
     acknowledged_note: note,
