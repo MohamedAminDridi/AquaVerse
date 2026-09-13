@@ -14,10 +14,23 @@ const nodeSchema = new mongoose.Schema({
   zone:                { type: String, default: null, trim: true },
   sensor_types:        [{ type: String }],
   report_interval_sec: { type: Number, default: 60, min: 30, max: 3600 },
+  // Derniere mesure connue. Les series temporelles gardent l'historique, mais
+  // une liste d'appareils a besoin de la valeur COURANTE sans agreger des
+  // milliers de points par noeud : sans ces champs, /overview renvoyait des
+  // vides et le sol / la temperature / l'humidite n'apparaissaient qu'apres
+  // l'arrivee d'un paquet temps reel — donc jamais pour un noeud en veille.
+  soil_moisture_pct:   { type: Number, default: null },
+  temperature:         { type: Number, default: null },   // °C
+  humidity:            { type: Number, default: null },   // % HR
+  rssi:                { type: Number, default: null },   // dBm du dernier saut LoRa
   battery_pct:         { type: Number, default: null },
   battery_charging:    { type: Boolean, default: false },  // INA219: charger detected
   battery_v:           { type: Number, default: null },    // INA219 bus voltage (V)
   battery_ma:          { type: Number, default: null },    // INA219 current (mA; − = charging)
+  // Autonomie estimee par le noeud (minutes) : vers 100% s'il charge, vers 0%
+  // sinon. Le firmware renvoie 0 quand il ne sait pas conclure (pas d'INA219,
+  // ou courant trop faible pour extrapoler) — l'interface traite 0 comme inconnu.
+  battery_time_min:    { type: Number, default: null },
   firmware_version:    { type: String, default: '0.0.0' },
   status:              { type: String, enum: ['online','offline','unknown'], default: 'unknown' },
   last_seen:           { type: Date, default: null },

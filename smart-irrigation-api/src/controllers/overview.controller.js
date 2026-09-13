@@ -34,7 +34,12 @@ exports.overview = asyncHandler(async (req, res) => {
   // slow to serialise, send and parse.
   const [nodes, gateways, summaryRows, openAlerts] = await Promise.all([
     Node.find({ farm: { $in: farmIds } })
+      // La fiche mobile affiche tout l'etat d'un noeud : tension, courant,
+      // veille et version de firmware en font partie. Ces champs sont scalaires
+      // (sleep tient en six cles) — le poids ajoute reste negligeable devant le
+      // heartbeat_log qu'on continue d'exclure.
       .select('name device_id status farm gateway last_seen battery_pct battery_charging '
+            + 'battery_v battery_ma battery_time_min firmware_version sleep report_interval_sec zone '
             + 'soil_moisture_pct temperature humidity valve_state valve_pct pump_state')
       .lean(),
 
